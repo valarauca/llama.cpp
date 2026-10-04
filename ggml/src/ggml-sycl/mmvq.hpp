@@ -24,6 +24,16 @@ void ggml_sycl_op_mul_mat_vec_q(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream);
 
+// Per-token strides for routing several tokens' experts in one launch: token t reads its ids at
+// ids_dev + t * ids_stride bytes, its quantized src1 at vy + t * src1_stride and writes dst_base + t * dst_stride.
+// The default is the single-token case.
+struct ggml_sycl_moe_tokens {
+    int    n_tokens    = 1;
+    size_t ids_stride  = 0;
+    size_t src1_stride = 0;
+    size_t dst_stride  = 0;
+};
+
 // Requires standard (non-reorder) block layout for src0.
 // Returns false if src0_type isn't handled; caller should fall back.
 bool ggml_sycl_mul_mat_vec_q_id(
@@ -38,7 +48,8 @@ bool ggml_sycl_mul_mat_vec_q_id(
     size_t             expert_weight_stride, // bytes between experts in vx_base
     size_t             dst_row_stride,       // bytes between dst rows
     size_t             src1_row_stride,      // 0 = shared src1, else per-expert stride in bytes
-    dpct::queue_ptr    stream);
+    dpct::queue_ptr    stream,
+    ggml_sycl_moe_tokens tokens = {});
 
 // Reorder (SoA) variant of the fused MoE expert GEMV.
 // vx_base: each expert slice (stride expert_weight_stride == src0->nb[2]) is a self-contained reorder/SoA layout.
@@ -55,7 +66,8 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
     size_t             expert_weight_stride,
     size_t             dst_row_stride,
     size_t             src1_row_stride,
-    dpct::queue_ptr    stream);
+    dpct::queue_ptr    stream,
+    ggml_sycl_moe_tokens tokens = {});
 
 // True if ggml_sycl_mul_mat_vec_q_glu_reorder has a fused kernel for same-type gate/up weights of this
 // type in the reorder layout.

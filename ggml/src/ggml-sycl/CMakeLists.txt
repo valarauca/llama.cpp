@@ -216,6 +216,11 @@ if (GGML_SYCL_GRAPH)
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_GRAPH)
 endif()
 
+if (GGML_SYCL_MOE_DEVICE_ROUTING)
+    message(STATUS "find GGML_SYCL_MOE_DEVICE_ROUTING")
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_MOE_DEVICE_ROUTING)
+endif()
+
 if (GGML_SYCL_HOST_MEM_FALLBACK)
     message(STATUS "find GGML_SYCL_HOST_MEM_FALLBACK")
     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_HOST_MEM_FALLBACK)

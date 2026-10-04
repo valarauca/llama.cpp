@@ -98,6 +98,7 @@ int g_ggml_sycl_enable_graph = 0;
 int g_ggml_sycl_enable_dnn = 1;
 int g_ggml_sycl_dnnl_wdecomp = 1;
 int g_ggml_sycl_q8_1_reuse = 1;
+int g_ggml_sycl_moe_device_routing = 1;
 int g_ggml_sycl_fa_onednn = 1;
 int g_ggml_sycl_fa_onednn_max_kv = 0;
 int g_ggml_sycl_enable_mkl_fa = 1;
@@ -406,6 +407,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
         g_ggml_sycl_dnnl_wdecomp = ggml_sycl_get_env("GGML_SYCL_DNNL_WDECOMP", 1);
         g_ggml_sycl_q8_1_reuse = ggml_sycl_get_env("GGML_SYCL_Q8_1_REUSE", 1);
+        g_ggml_sycl_moe_device_routing = ggml_sycl_get_env("GGML_SYCL_MOE_DEVICE_ROUTING", 1);
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
@@ -535,6 +537,12 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_GRAPH: %d\n", g_ggml_sycl_enable_graph);
 #else
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_GRAPH: graph disabled by compile flag\n");
+#endif
+
+#ifdef GGML_SYCL_MOE_DEVICE_ROUTING
+        GGML_LOG_INFO("  GGML_SYCL_MOE_DEVICE_ROUTING: %d\n", g_ggml_sycl_moe_device_routing);
+#else
+        GGML_LOG_INFO("  GGML_SYCL_MOE_DEVICE_ROUTING: disabled by compile flag\n");
 #endif
 
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_OPT: %d\n", g_ggml_sycl_enable_optimize);
@@ -5688,20 +5696,57 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(
 }
 
 // Fused MoE TG fast path. Returns false to fall back to the per-expert loop below.
+// True if this MUL_MAT_ID may route experts on the device without reading ids on the host: a single SYCL
+// device in the process, expert weights resident on this device (not split, and not a scheduler copy in a
+// compute buffer as with CPU-offloaded experts), and ids, src1 and dst on the same device. Anything else keeps
+// the host-routed path. Compiled out with -DGGML_SYCL_MOE_DEVICE_ROUTING=OFF.
+static bool ggml_sycl_moe_device_routing(ggml_backend_sycl_context & ctx, const ggml_tensor * dst) {
+#ifdef GGML_SYCL_MOE_DEVICE_ROUTING
+    if (!g_ggml_sycl_moe_device_routing || ggml_sycl_info().device_count != 1) {
+        return false;
+    }
+    const ggml_backend_buffer_type_t buft = ggml_backend_sycl_buffer_type(ctx.device);
+    const ggml_tensor *              src0 = dst->src[0];
+    if (src0->buffer == nullptr || src0->buffer->buft != buft ||
+        ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ dst->src[1], dst->src[2], dst }) {
+        if (t->buffer == nullptr || t->buffer->buft != buft) {
+            return false;
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+// Largest batch the device-routed MoE GEMV takes. It reads an expert's weights once per token that picks it,
+// while the host-routed path reads each picked expert once, so types whose host-path kernels are already fast
+// lose once real routing repeats experts: Qwen3-Coder-30B-A3B Q4_0 pp4 +6%, pp6 -1%, pp8 -5%, and Q8_0 is even
+// at 8 tokens on the op level. The other types still win at 8 (Coder IQ4_XS pp8 +38%, op level Q4_K, Q5_K,
+// Q6_K and IQ4_XS 55-82% faster).
+static int64_t ggml_sycl_moe_device_routing_max_tokens(ggml_type type) {
+    return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 ? 4 : MMVQ_MAX_BATCH_SIZE;
+}
+
 static bool ggml_sycl_mul_mat_id_mmvq_fused(
     ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
-    const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst)
+    const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, bool device_routing)
 {
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
-    if (ne12 != 1) return false;
+    if (ne12 != 1 && !(device_routing && ne12 <= ggml_sycl_moe_device_routing_max_tokens(src0->type))) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
     if (!ggml_is_contiguous(src1)) return false;
 
     const int64_t n_ids_per_group = ids->ne[0];
-    if (ids->ne[1] != 1) return false;
+    if (ids->ne[1] != ne12 || ids->nb[0] != sizeof(int32_t)) return false;
     if (ne11 != 1 && ne11 != n_ids_per_group) return false;
 
     const queue_ptr stream           = ctx.stream();
@@ -5717,20 +5762,26 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
 
     ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
-        (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+        (size_t) ne11 * ne12 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
     char * src1_ddq = src1_q8_alloc.get();
     if (use_reorder) {
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
             src1_padded_cols, stream);
     } else {
         quantize_row_q8_1_sycl<quantize_q8_1>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
             src1_padded_cols, stream);
     }
 
     const size_t bytes_per_qrow = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
     const size_t src1_row_stride = (ne11 == 1) ? 0 : bytes_per_qrow;
+
+    ggml_sycl_moe_tokens tokens;
+    tokens.n_tokens    = (int) ne12;
+    tokens.ids_stride  = ids->nb[1];
+    tokens.src1_stride = ne11 * bytes_per_qrow;
+    tokens.dst_stride  = dst->nb[2];
 
     if (use_reorder) {
         return ggml_sycl_mul_mat_vec_q_id_reorder(
@@ -5738,14 +5789,14 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
             (float *) dst->data, (int) ne10, nrows, n_experts_used,
             /*expert_weight_stride=*/ src0->nb[2],
             /*dst_row_stride=*/ dst->nb[1],
-            src1_row_stride, stream);
+            src1_row_stride, stream, tokens);
     }
     return ggml_sycl_mul_mat_vec_q_id(
         src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
         (float *) dst->data, (int) ne10, nrows, n_experts_used,
         /*expert_weight_stride=*/ src0->nb[2],
         /*dst_row_stride=*/ dst->nb[1],
-        src1_row_stride, stream);
+        src1_row_stride, stream, tokens);
 }
 
 // counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
@@ -5804,8 +5855,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    if (ne12 == 1 && ggml_sycl_src1_prec_allows(dst, GGML_PREC_Q8)) {
-        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+    const bool device_routing = ne12 > 1 && ggml_sycl_moe_device_routing(ctx, dst);
+    if ((ne12 == 1 || device_routing) && ggml_sycl_src1_prec_allows(dst, GGML_PREC_Q8)) {
+        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst, device_routing)) {
             return;
         }
     }

@@ -5236,8 +5236,17 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
         GGML_ASSERT((size_t) size == (size_t) src0->ne[2] * src0->nb[2]);
         switch (src0->type) {
             case GGML_TYPE_Q4_0:
+            case GGML_TYPE_IQ4_NL:
                 for (int64_t e = 0; e < src0->ne[2]; ++e) {
                     if (!reorder_qw_q4_0(data_device + e * src0->nb[2], ncols, nrows, src0->nb[2], 0, stream)) {
+                        GGML_ASSERT(e == 0);
+                        return false;
+                    }
+                }
+                return true;
+            case GGML_TYPE_IQ3_S:
+                for (int64_t e = 0; e < src0->ne[2]; ++e) {
+                    if (!reorder_qw_iq3_s(data_device + e * src0->nb[2], src0->nb[2], stream)) {
                         GGML_ASSERT(e == 0);
                         return false;
                     }
@@ -5340,7 +5349,7 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
         return;
     }
     if (src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
-        src0->type != GGML_TYPE_Q6_K) {
+        src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_IQ4_NL && src0->type != GGML_TYPE_IQ3_S) {
         return;
     }
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
@@ -5876,11 +5885,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     }
     if (device_routing && ne12 > ggml_sycl_moe_device_routing_max_tokens(src0->type) && g_ggml_sycl_moe_grouped &&
         ggml_sycl_moe_grouped_supported(ctx.device, src0, src1) && ggml_sycl_src1_prec_allows(dst, GGML_PREC_F16)) {
-        if (src0->type == GGML_TYPE_Q4_0) {
+        const bool needs_reorder = src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_IQ4_NL ||
+                                   src0->type == GGML_TYPE_IQ3_S;
+        if (needs_reorder) {
             opt_for_reorder_id(&ctx, src0);
         }
         const ggml_tensor_extra_gpu * src0_extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-        const bool layout_ok = src0->type != GGML_TYPE_Q4_0 || (src0_extra && src0_extra->optimized_feature.reorder);
+        const bool layout_ok = !needs_reorder || (src0_extra && src0_extra->optimized_feature.reorder);
         if (layout_ok && ggml_sycl_moe_grouped(ctx, src0, src1, ids, dst)) {
             return;
         }

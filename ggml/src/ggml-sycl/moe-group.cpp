@@ -47,6 +47,68 @@ struct moe_dq_q4_0 {
     }
 };
 
+// IQ4_NL expert in the per-expert reorder layout (the Q4_0 one): qs[N][K/2] then d[N][K/32].
+struct moe_dq_iq4_nl {
+    static constexpr int k_align = QK4_NL * MOE_KB;
+
+    static __dpct_inline__ void block(const uint8_t * slice, int N, int K, int n, int kb, sycl::half2 lo[8],
+                                      sycl::half2 hi[8]) {
+        const int         nb = K / QK4_NL;
+        const sycl::uint4 v4 = *(const sycl::uint4 *) (slice + (size_t) n * (K / 2) + (size_t) kb * (QK4_NL / 2));
+        const float       d  = *((const sycl::half *) (slice + (size_t) N * (K / 2)) + (size_t) n * nb + kb);
+        const uint32_t    w[4] = { v4.x(), v4.y(), v4.z(), v4.w() };
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t l = iq4nl_lookup4(w[i] & 0x0F0F0F0F);
+            const uint32_t h = iq4nl_lookup4((w[i] >> 4) & 0x0F0F0F0F);
+            lo[2 * i + 0] = sycl::half2(d * (int8_t) (l >> 0), d * (int8_t) (l >> 8));
+            lo[2 * i + 1] = sycl::half2(d * (int8_t) (l >> 16), d * (int8_t) (l >> 24));
+            hi[2 * i + 0] = sycl::half2(d * (int8_t) (h >> 0), d * (int8_t) (h >> 8));
+            hi[2 * i + 1] = sycl::half2(d * (int8_t) (h >> 16), d * (int8_t) (h >> 24));
+        }
+    }
+};
+
+// IQ3_S expert in the per-expert reorder layout: qs[nb][64], qh[nb][8], signs and scales[nb][36], d[nb].
+struct moe_dq_iq3_s {
+    static constexpr int k_align = QK_K;
+
+    static __dpct_inline__ void block(const uint8_t * slice, int N, int K, int n, int kb, sycl::half2 lo[8],
+                                      sycl::half2 hi[8]) {
+        constexpr int   ss_size = QK_K / 8 + QK_K / 64;
+        const int       nbk     = K / QK_K;
+        const int       nblocks = N * nbk;
+        const int       b       = n * nbk + kb / (QK_K / 32);
+        const int       ib      = kb % (QK_K / 32);
+        const sycl::uint2 q8    = *(const sycl::uint2 *) (slice + (size_t) b * (QK_K / 4) + 8 * ib);
+        const uint32_t  qh      = slice[(size_t) nblocks * (QK_K / 4) + (size_t) b * (QK_K / 32) + ib];
+        const uint8_t * ss      = slice + (size_t) nblocks * (QK_K / 4 + QK_K / 32) + (size_t) b * ss_size;
+        const uint32_t  signs   = *(const uint32_t *) (ss + 4 * ib);
+        const float     dall    = *((const sycl::half *) (slice + (size_t) nblocks * (QK_K / 4 + QK_K / 32 + ss_size)) + b);
+        const float     d       = dall * (1 + 2 * ((ss[QK_K / 8 + ib / 2] >> 4 * (ib % 2)) & 0xf));
+        const uint32_t  qs[2]   = { q8.x(), q8.y() };
+        float           v[32];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t i0 = (qs[l / 2] >> (16 * (l % 2))) & 0xFF;
+            const uint32_t i1 = (qs[l / 2] >> (16 * (l % 2) + 8)) & 0xFF;
+            const uint32_t g1 = iq3s_grid[i0 | ((qh << (8 - 2 * l)) & 256)];
+            const uint32_t g2 = iq3s_grid[i1 | ((qh << (7 - 2 * l)) & 256)];
+            const uint32_t sg = signs >> (8 * l);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                v[8 * l + j]     = d * (float) ((g1 >> (8 * j)) & 0xFF) * ((sg >> j) & 1 ? -1.f : 1.f);
+                v[8 * l + 4 + j] = d * (float) ((g2 >> (8 * j)) & 0xFF) * ((sg >> (4 + j)) & 1 ? -1.f : 1.f);
+            }
+        }
+#pragma unroll
+        for (int jp = 0; jp < 8; ++jp) {
+            lo[jp] = sycl::half2(v[2 * jp], v[2 * jp + 1]);
+            hi[jp] = sycl::half2(v[16 + 2 * jp], v[16 + 2 * jp + 1]);
+        }
+    }
+};
+
 // IQ4_XS expert in the standard layout, one 32-element sub-block per call.
 struct moe_dq_iq4_xs {
     static constexpr int k_align = QK_K;
@@ -183,6 +245,10 @@ bool ggml_sycl_moe_grouped_supported(int device, const ggml_tensor * src0, const
             return src0->ne[0] % moe_dq_q4_0::k_align == 0 && src0->nb[2] % 16 == 0;
         case GGML_TYPE_IQ4_XS:
             return src0->ne[0] % moe_dq_iq4_xs::k_align == 0 && src0->nb[2] % 8 == 0;
+        case GGML_TYPE_IQ4_NL:
+            return src0->ne[0] % moe_dq_iq4_nl::k_align == 0 && src0->nb[2] % 16 == 0;
+        case GGML_TYPE_IQ3_S:
+            return src0->ne[0] % moe_dq_iq3_s::k_align == 0 && src0->nb[2] % 8 == 0;
         default:
             return false;
     }
@@ -278,15 +344,27 @@ bool ggml_sycl_moe_grouped(ggml_backend_sycl_context & ctx, const ggml_tensor * 
         *(sycl::vec<sycl::half, 8> *) (x16 + (size_t) row * K + c * 8) = v.convert<sycl::half, sycl::rounding_mode::rte>();
     });
 
-    const uint8_t * W = (const uint8_t *) src0->data;
-    if (src0->type == GGML_TYPE_Q4_0) {
-        moe_grouped_gemm<moe_dq_q4_0>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt, (float *) dst->data,
-                                      N, K, max_tiles, n_used, dst->nb[1] / sizeof(float), dst->nb[2] / sizeof(float),
-                                      stream);
-    } else {
-        moe_grouped_gemm<moe_dq_iq4_xs>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
-                                        (float *) dst->data, N, K, max_tiles, n_used, dst->nb[1] / sizeof(float),
-                                        dst->nb[2] / sizeof(float), stream);
+    const uint8_t * W          = (const uint8_t *) src0->data;
+    const size_t    slot_st    = dst->nb[1] / sizeof(float);
+    const size_t    token_st   = dst->nb[2] / sizeof(float);
+    float *         dst_d      = (float *) dst->data;
+    switch (src0->type) {
+        case GGML_TYPE_Q4_0:
+            moe_grouped_gemm<moe_dq_q4_0>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt, dst_d, N, K,
+                                          max_tiles, n_used, slot_st, token_st, stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            moe_grouped_gemm<moe_dq_iq4_nl>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt, dst_d, N, K,
+                                            max_tiles, n_used, slot_st, token_st, stream);
+            break;
+        case GGML_TYPE_IQ3_S:
+            moe_grouped_gemm<moe_dq_iq3_s>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt, dst_d, N, K,
+                                           max_tiles, n_used, slot_st, token_st, stream);
+            break;
+        default:
+            moe_grouped_gemm<moe_dq_iq4_xs>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt, dst_d, N, K,
+                                            max_tiles, n_used, slot_st, token_st, stream);
+            break;
     }
     return true;
 #else

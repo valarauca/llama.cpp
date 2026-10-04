@@ -5244,6 +5244,14 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
                     }
                 }
                 return true;
+            case GGML_TYPE_Q8_0:
+                for (int64_t e = 0; e < src0->ne[2]; ++e) {
+                    if (!reorder_qw_q8_0(data_device + e * src0->nb[2], ncols, nrows, src0->nb[2], 0, stream)) {
+                        GGML_ASSERT(e == 0);
+                        return false;
+                    }
+                }
+                return true;
             case GGML_TYPE_IQ3_S:
                 for (int64_t e = 0; e < src0->ne[2]; ++e) {
                     if (!reorder_qw_iq3_s(data_device + e * src0->nb[2], src0->nb[2], stream)) {
@@ -5364,9 +5372,9 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
         return;
     }
-    if (src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q2_K && src0->type != GGML_TYPE_Q3_K &&
-        src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K &&
-        src0->type != GGML_TYPE_IQ4_NL && src0->type != GGML_TYPE_IQ3_S) {
+    if (src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q2_K &&
+        src0->type != GGML_TYPE_Q3_K && src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
+        src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_IQ4_NL && src0->type != GGML_TYPE_IQ3_S) {
         return;
     }
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);

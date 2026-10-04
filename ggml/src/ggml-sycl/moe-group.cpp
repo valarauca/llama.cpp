@@ -48,6 +48,44 @@ struct moe_dq_q4_0 {
     }
 };
 
+// 32 bytes at p (16-byte aligned) as eight words.
+static __dpct_inline__ void moe_load32(const uint8_t * p, uint32_t w[8]) {
+    const sycl::uint4 a = *(const sycl::uint4 *) p;
+    const sycl::uint4 b = *(const sycl::uint4 *) (p + 16);
+    w[0] = a.x(); w[1] = a.y(); w[2] = a.z(); w[3] = a.w();
+    w[4] = b.x(); w[5] = b.y(); w[6] = b.z(); w[7] = b.w();
+}
+
+static __dpct_inline__ uint32_t moe_byte(const uint32_t w[8], int j) {
+    return (w[j / 4] >> (8 * (j % 4))) & 0xFF;
+}
+
+static __dpct_inline__ void moe_pack(const float v[32], sycl::half2 lo[8], sycl::half2 hi[8]) {
+#pragma unroll
+    for (int jp = 0; jp < 8; ++jp) {
+        lo[jp] = sycl::half2(v[2 * jp], v[2 * jp + 1]);
+        hi[jp] = sycl::half2(v[16 + 2 * jp], v[16 + 2 * jp + 1]);
+    }
+}
+
+// Q8_0 expert in the per-expert reorder layout: qs[N][K] then d[N][K/32].
+struct moe_dq_q8_0 {
+    static constexpr int k_align = QK8_0 * MOE_KB;
+
+    static __dpct_inline__ void block(const uint8_t * slice, int N, int K, int n, int kb, sycl::half2 lo[8],
+                                      sycl::half2 hi[8]) {
+        uint32_t w[8];
+        moe_load32(slice + (size_t) n * K + (size_t) kb * QK8_0, w);
+        const float d = *((const sycl::half *) (slice + (size_t) N * K) + (size_t) n * (K / QK8_0) + kb);
+        float       v[32];
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            v[j] = d * (int8_t) moe_byte(w, j);
+        }
+        moe_pack(v, lo, hi);
+    }
+};
+
 // IQ4_NL expert in the per-expert reorder layout (the Q4_0 one): qs[N][K/2] then d[N][K/32].
 struct moe_dq_iq4_nl {
     static constexpr int k_align = QK4_NL * MOE_KB;
@@ -109,26 +147,6 @@ struct moe_dq_iq3_s {
         }
     }
 };
-
-// 32 bytes at p (16-byte aligned) as eight words.
-static __dpct_inline__ void moe_load32(const uint8_t * p, uint32_t w[8]) {
-    const sycl::uint4 a = *(const sycl::uint4 *) p;
-    const sycl::uint4 b = *(const sycl::uint4 *) (p + 16);
-    w[0] = a.x(); w[1] = a.y(); w[2] = a.z(); w[3] = a.w();
-    w[4] = b.x(); w[5] = b.y(); w[6] = b.z(); w[7] = b.w();
-}
-
-static __dpct_inline__ uint32_t moe_byte(const uint32_t w[8], int j) {
-    return (w[j / 4] >> (8 * (j % 4))) & 0xFF;
-}
-
-static __dpct_inline__ void moe_pack(const float v[32], sycl::half2 lo[8], sycl::half2 hi[8]) {
-#pragma unroll
-    for (int jp = 0; jp < 8; ++jp) {
-        lo[jp] = sycl::half2(v[2 * jp], v[2 * jp + 1]);
-        hi[jp] = sycl::half2(v[16 + 2 * jp], v[16 + 2 * jp + 1]);
-    }
-}
 
 // Q4_K expert, per-expert reorder layout qs[nb][128], scales[nb][12], dm[nb]. Group g of a super-block is the
 // low (even g) or high (odd g) nibbles of its 32-byte quarter g / 2, with one scale and min.
@@ -419,6 +437,8 @@ bool ggml_sycl_moe_grouped_supported(int device, const ggml_tensor * src0, const
             return src0->ne[0] % moe_dq_iq4_xs::k_align == 0 && src0->nb[2] % 8 == 0;
         case GGML_TYPE_IQ4_NL:
             return src0->ne[0] % moe_dq_iq4_nl::k_align == 0 && src0->nb[2] % 16 == 0;
+        case GGML_TYPE_Q8_0:
+            return src0->ne[0] % moe_dq_q8_0::k_align == 0 && src0->nb[2] % 16 == 0;
         case GGML_TYPE_IQ3_S:
             return src0->ne[0] % moe_dq_iq3_s::k_align == 0 && src0->nb[2] % 8 == 0;
         case GGML_TYPE_Q2_K:
@@ -529,6 +549,10 @@ bool ggml_sycl_moe_grouped(ggml_backend_sycl_context & ctx, const ggml_tensor * 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
             moe_grouped_gemm<moe_dq_q4_0>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt, dst_d, N, K,
+                                          max_tiles, n_used, slot_st, token_st, stream);
+            break;
+        case GGML_TYPE_Q8_0:
+            moe_grouped_gemm<moe_dq_q8_0>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt, dst_d, N, K,
                                           max_tiles, n_used, slot_st, token_st, stream);
             break;
         case GGML_TYPE_IQ4_NL:

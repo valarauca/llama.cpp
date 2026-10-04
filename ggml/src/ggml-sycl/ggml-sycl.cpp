@@ -5252,6 +5252,22 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
                     }
                 }
                 return true;
+            case GGML_TYPE_Q2_K:
+                for (int64_t e = 0; e < src0->ne[2]; ++e) {
+                    if (!reorder_qw_q2_k(data_device + e * src0->nb[2], src0->nb[2], 0, stream)) {
+                        GGML_ASSERT(e == 0);
+                        return false;
+                    }
+                }
+                return true;
+            case GGML_TYPE_Q3_K:
+                for (int64_t e = 0; e < src0->ne[2]; ++e) {
+                    if (!reorder_qw_q3_k(data_device + e * src0->nb[2], src0->nb[2], 0, stream)) {
+                        GGML_ASSERT(e == 0);
+                        return false;
+                    }
+                }
+                return true;
             case GGML_TYPE_Q4_K:
                 return reorder_qw_q4_k_moe(data_device, src0->nb[2], src0->ne[2], stream);
             case GGML_TYPE_Q5_K:
@@ -5348,8 +5364,9 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
         return;
     }
-    if (src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
-        src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_IQ4_NL && src0->type != GGML_TYPE_IQ3_S) {
+    if (src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q2_K && src0->type != GGML_TYPE_Q3_K &&
+        src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K &&
+        src0->type != GGML_TYPE_IQ4_NL && src0->type != GGML_TYPE_IQ3_S) {
         return;
     }
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
@@ -5885,8 +5902,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     }
     if (device_routing && ne12 > ggml_sycl_moe_device_routing_max_tokens(src0->type) && g_ggml_sycl_moe_grouped &&
         ggml_sycl_moe_grouped_supported(ctx.device, src0, src1) && ggml_sycl_src1_prec_allows(dst, GGML_PREC_F16)) {
-        const bool needs_reorder = src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_IQ4_NL ||
-                                   src0->type == GGML_TYPE_IQ3_S;
+        const bool needs_reorder = src0->type != GGML_TYPE_IQ4_XS;
         if (needs_reorder) {
             opt_for_reorder_id(&ctx, src0);
         }

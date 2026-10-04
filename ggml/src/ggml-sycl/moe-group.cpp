@@ -12,6 +12,7 @@
 
 #include "moe-group.hpp"
 #include "iq4nl.hpp"
+#include "wdecomp-lanes.hpp"
 
 #if defined(GGML_SYCL_MOE_DEVICE_ROUTING) && \
     (!defined(GGML_SYCL_XE_FAMILY_AOT) ||    \
@@ -99,6 +100,32 @@ struct moe_dq_iq3_s {
             for (int j = 0; j < 4; ++j) {
                 v[8 * l + j]     = d * (float) ((g1 >> (8 * j)) & 0xFF) * ((sg >> j) & 1 ? -1.f : 1.f);
                 v[8 * l + 4 + j] = d * (float) ((g2 >> (8 * j)) & 0xFF) * ((sg >> (4 + j)) & 1 ? -1.f : 1.f);
+            }
+        }
+#pragma unroll
+        for (int jp = 0; jp < 8; ++jp) {
+            lo[jp] = sycl::half2(v[2 * jp], v[2 * jp + 1]);
+            hi[jp] = sycl::half2(v[16 + 2 * jp], v[16 + 2 * jp + 1]);
+        }
+    }
+};
+
+// K-quant expert in the per-expert reorder layout, decoded eight weights at a time by the shared lane decoders.
+template <wdecomp_decoder_t decode>
+struct moe_dq_lanes {
+    static constexpr int k_align = QK_K;
+
+    static __dpct_inline__ void block(const uint8_t * slice, int N, int K, int n, int kb, sycl::half2 lo[8],
+                                      sycl::half2 hi[8]) {
+        const int64_t k  = (int64_t) N * K;
+        const int64_t l0 = ((int64_t) n * K + (int64_t) kb * 32) / 8;
+        float         v[32];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const wdecomp_lane r = decode(slice, l0 + c, k);
+#pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                v[8 * c + m] = r.s * r.q[m] + r.b;
             }
         }
 #pragma unroll
@@ -249,6 +276,12 @@ bool ggml_sycl_moe_grouped_supported(int device, const ggml_tensor * src0, const
             return src0->ne[0] % moe_dq_iq4_nl::k_align == 0 && src0->nb[2] % 16 == 0;
         case GGML_TYPE_IQ3_S:
             return src0->ne[0] % moe_dq_iq3_s::k_align == 0 && src0->nb[2] % 8 == 0;
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return src0->ne[0] % QK_K == 0 && src0->nb[2] % 4 == 0;
         default:
             return false;
     }
@@ -360,6 +393,26 @@ bool ggml_sycl_moe_grouped(ggml_backend_sycl_context & ctx, const ggml_tensor * 
         case GGML_TYPE_IQ3_S:
             moe_grouped_gemm<moe_dq_iq3_s>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt, dst_d, N, K,
                                            max_tiles, n_used, slot_st, token_st, stream);
+            break;
+        case GGML_TYPE_Q2_K:
+            moe_grouped_gemm<moe_dq_lanes<wdecomp_q2_K>>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
+                                                         dst_d, N, K, max_tiles, n_used, slot_st, token_st, stream);
+            break;
+        case GGML_TYPE_Q3_K:
+            moe_grouped_gemm<moe_dq_lanes<wdecomp_q3_K>>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
+                                                         dst_d, N, K, max_tiles, n_used, slot_st, token_st, stream);
+            break;
+        case GGML_TYPE_Q4_K:
+            moe_grouped_gemm<moe_dq_lanes<wdecomp_q4_K>>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
+                                                         dst_d, N, K, max_tiles, n_used, slot_st, token_st, stream);
+            break;
+        case GGML_TYPE_Q5_K:
+            moe_grouped_gemm<moe_dq_lanes<wdecomp_q5_K>>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
+                                                         dst_d, N, K, max_tiles, n_used, slot_st, token_st, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            moe_grouped_gemm<moe_dq_lanes<wdecomp_q6_K>>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
+                                                         dst_d, N, K, max_tiles, n_used, slot_st, token_st, stream);
             break;
         default:
             moe_grouped_gemm<moe_dq_iq4_xs>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt, dst_d, N, K,

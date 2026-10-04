@@ -16,8 +16,8 @@
 #include "common.hpp"
 
 // True if ggml_sycl_moe_grouped can run src0 (expert weights) of this type on the device: a build with the
-// grouped kernel, a device with 16-wide XMX, and a type with a grouped dequant (Q4_0, IQ4_NL, IQ3_S, IQ4_XS).
-// Q4_0, IQ4_NL and IQ3_S additionally need the per-expert reorder layout, which the caller installs.
+// grouped kernel, a device with 16-wide XMX, and a type with a grouped dequant (Q4_0, IQ4_NL, IQ3_S, IQ4_XS and
+// Q2_K-Q6_K). All but IQ4_XS additionally need the per-expert reorder layout, which the caller installs.
 bool ggml_sycl_moe_grouped_supported(int device, const ggml_tensor * src0, const ggml_tensor * src1);
 
 // MUL_MAT_ID for a batch of tokens without reading ids on the host: counts and sorts the routed rows per expert

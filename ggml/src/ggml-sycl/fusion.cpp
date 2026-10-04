@@ -64,6 +64,37 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     return true;
 }
 
+// rope + view + set_rows: rope writes its rows straight into the KV cache rows set_rows selects.
+// Mirrors ggml_cuda_should_fuse_rope_set_rows: only the norm/neox rope kernels take row indices.
+static bool ggml_sycl_should_fuse_rope_set_rows(const ggml_tensor * rope, const ggml_tensor * view,
+                                                const ggml_tensor * set_rows) {
+    if (rope->src[0]->ne[3] != 1) {
+        return false;
+    }
+    if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (set_rows->src[1]->type != GGML_TYPE_I64) {
+        return false;
+    }
+    if (rope->src[0]->type == GGML_TYPE_F16 && set_rows->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (!ggml_is_contiguous(view) || view->ne[0] != rope->ne[0] * rope->ne[1]) {
+        return false;
+    }
+    const int mode = ggml_get_op_params_i32(rope, 2);
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+        return false;
+    }
+
+    const char * in_lo  = static_cast<const char *>(rope->src[0]->data);
+    const char * in_hi  = in_lo + ggml_nbytes(rope->src[0]);
+    const char * out_lo = static_cast<const char *>(set_rows->data);
+    const char * out_hi = out_lo + ggml_nbytes(set_rows);
+    return out_hi <= in_lo || in_hi <= out_lo;
+}
+
 bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
                         std::initializer_list<enum ggml_unary_op> unary_ops) {
 #ifndef NDEBUG
@@ -95,6 +126,15 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         }
 
         return ggml_sycl_should_fuse_mul_mat_glu(gate, up, glu);
+    }
+
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ROPE && ops.begin()[1] == GGML_OP_VIEW &&
+        ops.begin()[2] == GGML_OP_SET_ROWS) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 2 })) {
+            return false;
+        }
+        return ggml_sycl_should_fuse_rope_set_rows(cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1],
+                                                   cgraph->nodes[node_idx + 2]);
     }
 
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {

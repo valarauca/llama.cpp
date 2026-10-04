@@ -12,7 +12,7 @@
 
 #include "moe-group.hpp"
 #include "iq4nl.hpp"
-#include "wdecomp-lanes.hpp"
+#include "dequantize.hpp"
 
 #if defined(GGML_SYCL_MOE_DEVICE_ROUTING) && \
     (!defined(GGML_SYCL_XE_FAMILY_AOT) ||    \
@@ -110,29 +110,174 @@ struct moe_dq_iq3_s {
     }
 };
 
-// K-quant expert in the per-expert reorder layout, decoded eight weights at a time by the shared lane decoders.
-template <wdecomp_decoder_t decode>
-struct moe_dq_lanes {
+// 32 bytes at p (16-byte aligned) as eight words.
+static __dpct_inline__ void moe_load32(const uint8_t * p, uint32_t w[8]) {
+    const sycl::uint4 a = *(const sycl::uint4 *) p;
+    const sycl::uint4 b = *(const sycl::uint4 *) (p + 16);
+    w[0] = a.x(); w[1] = a.y(); w[2] = a.z(); w[3] = a.w();
+    w[4] = b.x(); w[5] = b.y(); w[6] = b.z(); w[7] = b.w();
+}
+
+static __dpct_inline__ uint32_t moe_byte(const uint32_t w[8], int j) {
+    return (w[j / 4] >> (8 * (j % 4))) & 0xFF;
+}
+
+static __dpct_inline__ void moe_pack(const float v[32], sycl::half2 lo[8], sycl::half2 hi[8]) {
+#pragma unroll
+    for (int jp = 0; jp < 8; ++jp) {
+        lo[jp] = sycl::half2(v[2 * jp], v[2 * jp + 1]);
+        hi[jp] = sycl::half2(v[16 + 2 * jp], v[16 + 2 * jp + 1]);
+    }
+}
+
+// Q4_K expert, per-expert reorder layout qs[nb][128], scales[nb][12], dm[nb]. Group g of a super-block is the
+// low (even g) or high (odd g) nibbles of its 32-byte quarter g / 2, with one scale and min.
+struct moe_dq_q4_K {
     static constexpr int k_align = QK_K;
 
     static __dpct_inline__ void block(const uint8_t * slice, int N, int K, int n, int kb, sycl::half2 lo[8],
                                       sycl::half2 hi[8]) {
-        const int64_t k  = (int64_t) N * K;
-        const int64_t l0 = ((int64_t) n * K + (int64_t) kb * 32) / 8;
-        float         v[32];
+        const int nblocks = N * (K / QK_K);
+        const int b       = n * (K / QK_K) + kb / 8;
+        const int g       = kb % 8;
+        uint32_t  w[8];
+        moe_load32(slice + (size_t) b * (QK_K / 2) + 32 * (g / 2), w);
+        const ggml_half2 dm = *(const ggml_half2 *) (slice + (size_t) nblocks * (QK_K / 2 + K_SCALE_SIZE) + (size_t) b * 4);
+        uint8_t sc, mn;
+        get_scale_min_k4(g, slice + (size_t) nblocks * (QK_K / 2) + (size_t) b * K_SCALE_SIZE, sc, mn);
+        const float d1 = (float) dm.x() * sc;
+        const float m1 = (float) dm.y() * mn;
+        const int   sh = 4 * (g % 2);
+        float       v[32];
 #pragma unroll
-        for (int c = 0; c < 4; ++c) {
-            const wdecomp_lane r = decode(slice, l0 + c, k);
-#pragma unroll
-            for (int m = 0; m < 8; ++m) {
-                v[8 * c + m] = r.s * r.q[m] + r.b;
-            }
+        for (int j = 0; j < 32; ++j) {
+            v[j] = d1 * ((moe_byte(w, j) >> sh) & 0xF) - m1;
         }
+        moe_pack(v, lo, hi);
+    }
+};
+
+// Q5_K expert, per-expert reorder layout qs[nb][128], qh[nb][32], scales[nb][12], dm[nb].
+struct moe_dq_q5_K {
+    static constexpr int k_align = QK_K;
+
+    static __dpct_inline__ void block(const uint8_t * slice, int N, int K, int n, int kb, sycl::half2 lo[8],
+                                      sycl::half2 hi[8]) {
+        const int nblocks = N * (K / QK_K);
+        const int b       = n * (K / QK_K) + kb / 8;
+        const int g       = kb % 8;
+        uint32_t  w[8], h[8];
+        moe_load32(slice + (size_t) b * (QK_K / 2) + 32 * (g / 2), w);
+        moe_load32(slice + (size_t) nblocks * (QK_K / 2) + (size_t) b * (QK_K / 8), h);
+        const uint8_t *  base_sc = slice + (size_t) nblocks * (QK_K / 2 + QK_K / 8);
+        const ggml_half2 dm = *(const ggml_half2 *) (base_sc + (size_t) nblocks * K_SCALE_SIZE + (size_t) b * 4);
+        uint8_t sc, mn;
+        get_scale_min_k4(g, base_sc + (size_t) b * K_SCALE_SIZE, sc, mn);
+        const float d1 = (float) dm.x() * sc;
+        const float m1 = (float) dm.y() * mn;
+        const int   sh = 4 * (g % 2);
+        float       v[32];
 #pragma unroll
-        for (int jp = 0; jp < 8; ++jp) {
-            lo[jp] = sycl::half2(v[2 * jp], v[2 * jp + 1]);
-            hi[jp] = sycl::half2(v[16 + 2 * jp], v[16 + 2 * jp + 1]);
+        for (int j = 0; j < 32; ++j) {
+            v[j] = d1 * (((moe_byte(w, j) >> sh) & 0xF) + ((moe_byte(h, j) >> g) & 1 ? 16 : 0)) - m1;
         }
+        moe_pack(v, lo, hi);
+    }
+};
+
+// Q6_K expert, per-expert reorder layout ql[nb][128], qh[nb][64], scales[nb][16], d[nb]. Group g is quarter
+// g % 4 of half g / 4, with a new scale every 16 weights.
+struct moe_dq_q6_K {
+    static constexpr int k_align = QK_K;
+
+    static __dpct_inline__ void block(const uint8_t * slice, int N, int K, int n, int kb, sycl::half2 lo[8],
+                                      sycl::half2 hi[8]) {
+        const int nblocks = N * (K / QK_K);
+        const int b       = n * (K / QK_K) + kb / 8;
+        const int ip      = (kb % 8) / 4;
+        const int q4      = kb % 4;
+        uint32_t  w[8], h[8];
+        moe_load32(slice + (size_t) b * (QK_K / 2) + 64 * ip + 32 * (q4 & 1), w);
+        moe_load32(slice + (size_t) nblocks * (QK_K / 2) + (size_t) b * (QK_K / 4) + 32 * ip, h);
+        const int8_t * sc = (const int8_t *) (slice + (size_t) nblocks * (QK_K / 2 + QK_K / 4) + (size_t) b * (QK_K / 16) +
+                                              8 * ip + 2 * q4);
+        const float    d  = *((const sycl::half *) (slice + (size_t) nblocks * (QK_K / 2 + QK_K / 4 + QK_K / 16)) + b);
+        const float    s0 = d * sc[0];
+        const float    s1 = d * sc[1];
+        const int      sh = 4 * (q4 >> 1);
+        float          v[32];
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const int q = (int) (((moe_byte(w, j) >> sh) & 0xF) | (((moe_byte(h, j) >> (2 * q4)) & 3) << 4)) - 32;
+            v[j]        = (j < 16 ? s0 : s1) * q;
+        }
+        moe_pack(v, lo, hi);
+    }
+};
+
+// Q2_K expert, per-expert reorder layout qs[nb][64], scales[nb][16], dm[nb]. Group g uses bits 2 * (g % 4) of
+// the 32-byte half g / 4, with a new scale and min every 16 weights.
+struct moe_dq_q2_K {
+    static constexpr int k_align = QK_K;
+
+    static __dpct_inline__ void block(const uint8_t * slice, int N, int K, int n, int kb, sycl::half2 lo[8],
+                                      sycl::half2 hi[8]) {
+        const int nblocks = N * (K / QK_K);
+        const int b       = n * (K / QK_K) + kb / 8;
+        const int hh      = (kb % 8) / 4;
+        const int j4      = kb % 4;
+        uint32_t  w[8];
+        moe_load32(slice + (size_t) b * (QK_K / 4) + 32 * hh, w);
+        const uint8_t *  scales = slice + (size_t) nblocks * (QK_K / 4) + (size_t) b * (QK_K / 16) + 8 * hh + 2 * j4;
+        const ggml_half2 dm     = *(const ggml_half2 *) (slice + (size_t) nblocks * (QK_K / 4 + QK_K / 16) + (size_t) b * 4);
+        const float      dall   = dm.x();
+        const float      dmin   = dm.y();
+        const float      d0 = dall * (scales[0] & 0xF), m0 = dmin * (scales[0] >> 4);
+        const float      d1 = dall * (scales[1] & 0xF), m1 = dmin * (scales[1] >> 4);
+        float            v[32];
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const int q = (moe_byte(w, j) >> (2 * j4)) & 3;
+            v[j]        = j < 16 ? d0 * q - m0 : d1 * q - m1;
+        }
+        moe_pack(v, lo, hi);
+    }
+};
+
+// Q3_K expert, per-expert reorder layout qs[nb][64], hmask[nb][32], scales[nb][12], d[nb].
+struct moe_dq_q3_K {
+    static constexpr int k_align = QK_K;
+
+    static __dpct_inline__ int scale(const uint8_t * scales, int is) {
+        const int us = is < 4 ? (scales[is - 0] & 0xF) | (((scales[is + 8] >> 0) & 3) << 4) :
+                       is < 8 ? (scales[is - 0] & 0xF) | (((scales[is + 4] >> 2) & 3) << 4) :
+                       is < 12 ? (scales[is - 8] >> 4) | (((scales[is + 0] >> 4) & 3) << 4) :
+                                 (scales[is - 8] >> 4) | (((scales[is - 4] >> 6) & 3) << 4);
+        return us - 32;
+    }
+
+    static __dpct_inline__ void block(const uint8_t * slice, int N, int K, int n, int kb, sycl::half2 lo[8],
+                                      sycl::half2 hi[8]) {
+        const int nblocks = N * (K / QK_K);
+        const int b       = n * (K / QK_K) + kb / 8;
+        const int nn      = (kb % 8) / 4;
+        const int j4      = kb % 4;
+        uint32_t  w[8], h[8];
+        moe_load32(slice + (size_t) b * (QK_K / 4) + 32 * nn, w);
+        moe_load32(slice + (size_t) nblocks * (QK_K / 4) + (size_t) b * (QK_K / 8), h);
+        const uint8_t * scales = slice + (size_t) nblocks * (QK_K / 4 + QK_K / 8) + (size_t) b * 12;
+        const float     d_all  = *((const sycl::half *) (slice + (size_t) nblocks * (QK_K / 4 + QK_K / 8 + 12)) + b);
+        const int       is     = 8 * nn + 2 * j4;
+        const float     s0     = d_all * scale(scales, is);
+        const float     s1     = d_all * scale(scales, is + 1);
+        const int       mk     = 4 * nn + j4;
+        float           v[32];
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const int q = (int) ((moe_byte(w, j) >> (2 * j4)) & 3) - ((moe_byte(h, j) >> mk) & 1 ? 0 : 4);
+            v[j]        = (j < 16 ? s0 : s1) * q;
+        }
+        moe_pack(v, lo, hi);
     }
 };
 
@@ -281,7 +426,7 @@ bool ggml_sycl_moe_grouped_supported(int device, const ggml_tensor * src0, const
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
-            return src0->ne[0] % QK_K == 0 && src0->nb[2] % 4 == 0;
+            return src0->ne[0] % QK_K == 0 && src0->nb[2] % 16 == 0;
         default:
             return false;
     }
@@ -395,23 +540,23 @@ bool ggml_sycl_moe_grouped(ggml_backend_sycl_context & ctx, const ggml_tensor * 
                                            max_tiles, n_used, slot_st, token_st, stream);
             break;
         case GGML_TYPE_Q2_K:
-            moe_grouped_gemm<moe_dq_lanes<wdecomp_q2_K>>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
+            moe_grouped_gemm<moe_dq_q2_K>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
                                                          dst_d, N, K, max_tiles, n_used, slot_st, token_st, stream);
             break;
         case GGML_TYPE_Q3_K:
-            moe_grouped_gemm<moe_dq_lanes<wdecomp_q3_K>>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
+            moe_grouped_gemm<moe_dq_q3_K>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
                                                          dst_d, N, K, max_tiles, n_used, slot_st, token_st, stream);
             break;
         case GGML_TYPE_Q4_K:
-            moe_grouped_gemm<moe_dq_lanes<wdecomp_q4_K>>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
+            moe_grouped_gemm<moe_dq_q4_K>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
                                                          dst_d, N, K, max_tiles, n_used, slot_st, token_st, stream);
             break;
         case GGML_TYPE_Q5_K:
-            moe_grouped_gemm<moe_dq_lanes<wdecomp_q5_K>>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
+            moe_grouped_gemm<moe_dq_q5_K>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
                                                          dst_d, N, K, max_tiles, n_used, slot_st, token_st, stream);
             break;
         case GGML_TYPE_Q6_K:
-            moe_grouped_gemm<moe_dq_lanes<wdecomp_q6_K>>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
+            moe_grouped_gemm<moe_dq_q6_K>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
                                                          dst_d, N, K, max_tiles, n_used, slot_st, token_st, stream);
             break;
         default:

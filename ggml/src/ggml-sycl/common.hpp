@@ -343,10 +343,33 @@ struct mmid_row_mapping {
 };
 
 namespace sycl_ex = sycl::ext::oneapi::experimental;
+// The last q8_1-quantized src1 of a mat-mul, kept so sibling mat-muls reading the same activation
+// (Q/K/V, GDN projections) skip requantizing it. Valid until a graph node writes into [src, src + src_bytes).
+// Only the top-level MUL_MAT graph node being computed (node) may use it, never internal sub-mat-muls.
+struct ggml_sycl_q8_1_cache {
+    const ggml_tensor * node = nullptr;
+    queue_ptr    q         = nullptr;
+    void *       buf       = nullptr;
+    size_t       cap       = 0;
+    const void * src       = nullptr;
+    size_t       src_bytes = 0;
+    size_t       layout    = 0;
+    int64_t      ne10      = 0;
+    int64_t      nrows     = 0;
+    int64_t      padded    = 0;
+
+    ~ggml_sycl_q8_1_cache() {
+        if (buf != nullptr) {
+            sycl::free(buf, *q);
+        }
+    }
+};
+
 struct ggml_backend_sycl_context {
     int device;
     std::string name;
     optimize_feature opt_feature;
+    ggml_sycl_q8_1_cache q8_1_cache;
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 

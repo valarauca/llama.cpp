@@ -97,6 +97,7 @@ int g_ggml_sycl_enable_optimize = 1;
 int g_ggml_sycl_enable_graph = 0;
 int g_ggml_sycl_enable_dnn = 1;
 int g_ggml_sycl_dnnl_wdecomp = 1;
+int g_ggml_sycl_q8_1_reuse = 1;
 int g_ggml_sycl_fa_onednn = 1;
 int g_ggml_sycl_fa_onednn_max_kv = 0;
 int g_ggml_sycl_enable_mkl_fa = 1;
@@ -404,6 +405,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
         g_ggml_sycl_dnnl_wdecomp = ggml_sycl_get_env("GGML_SYCL_DNNL_WDECOMP", 1);
+        g_ggml_sycl_q8_1_reuse = ggml_sycl_get_env("GGML_SYCL_Q8_1_REUSE", 1);
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
@@ -3628,17 +3630,47 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         }
 
         if constexpr(quantize_enabled) {
-            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
-
-            if (src1_on_device && src1_is_contiguous) {
+            const size_t           q8_bytes = nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
+            const size_t           layout   = typeid(quantize_f<QK8_1 / WARP_SIZE>).hash_code();
+            ggml_sycl_q8_1_cache & qc       = ctx.q8_1_cache;
+            const bool use_cache = !split && src1_on_device && src1_is_contiguous && !g_ggml_sycl_enable_graph &&
+                                   g_ggml_sycl_q8_1_reuse && qc.node == dst && dst->src[1] == src1;
+            if (use_cache && qc.src == src1->data && qc.layout == layout && qc.ne10 == ne10 && qc.nrows == nrows1 &&
+                qc.padded == src1_padded_col_size) {
+                dev[i].src1_ddq = static_cast<char *>(qc.buf);
+            } else if (use_cache) {
+                if (q8_bytes > qc.cap) {
+                    stream->wait();
+                    if (qc.buf != nullptr) {
+                        sycl::free(qc.buf, *qc.q);
+                    }
+                    qc.buf = sycl::malloc_device(q8_bytes, *stream);
+                    qc.cap = q8_bytes;
+                    qc.q   = stream;
+                }
+                dev[i].src1_ddq = static_cast<char *>(qc.buf);
                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
-                                                     /*num_src=*/2, " : converting src1 to Q8_1");
-                try {
-                    quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
-                } catch (sycl::exception const &exc) {
-                    std::cerr << "Quantize_row_q8_1_sycl error" << exc.what() << "Exception caught at file:" << __FILE__
-                              << ", line:" << __LINE__ << std::endl;
-                    std::exit(1);
+                                                     /*num_src=*/2, " : converting src1 to Q8_1 (cached)");
+                quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
+                qc.src       = src1->data;
+                qc.src_bytes = ggml_nbytes(src1);
+                qc.layout    = layout;
+                qc.ne10      = ne10;
+                qc.nrows     = nrows1;
+                qc.padded    = src1_padded_col_size;
+            } else {
+                dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), q8_bytes);
+
+                if (src1_on_device && src1_is_contiguous) {
+                    scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
+                                                         /*num_src=*/2, " : converting src1 to Q8_1");
+                    try {
+                        quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
+                    } catch (sycl::exception const &exc) {
+                        std::cerr << "Quantize_row_q8_1_sycl error" << exc.what() << "Exception caught at file:" << __FILE__
+                                  << ", line:" << __LINE__ << std::endl;
+                        std::exit(1);
+                    }
                 }
             }
         }
@@ -6622,11 +6654,32 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// Drops the cached q8_1 src1 if any node in (checked, upto] writes into the activation it was built from.
+static void ggml_sycl_q8_1_cache_note_writes(ggml_sycl_q8_1_cache & qc, const ggml_cgraph * cgraph, int & checked,
+                                             int upto) {
+    for (; checked < upto; ++checked) {
+        const ggml_tensor * t = cgraph->nodes[checked + 1];
+        if (qc.src == nullptr || ggml_sycl_is_view_or_noop(t) || t->data == nullptr) {
+            continue;
+        }
+        const char * lo = static_cast<const char *>(t->data);
+        const char * hi = lo + ggml_nbytes(t);
+        const char * c  = static_cast<const char *>(qc.src);
+        if (lo < c + qc.src_bytes && c < hi) {
+            qc.src = nullptr;
+        }
+    }
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
 
+    sycl_ctx->q8_1_cache.src = nullptr;
+    int q8_1_checked = -1;
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        ggml_sycl_q8_1_cache_note_writes(sycl_ctx->q8_1_cache, cgraph, q8_1_checked, i);
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
         }
@@ -6726,7 +6779,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        sycl_ctx->q8_1_cache.node = node->op == GGML_OP_MUL_MAT ? node : nullptr;
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+        sycl_ctx->q8_1_cache.node = nullptr;
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }

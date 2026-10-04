@@ -75,6 +75,7 @@
 #include "ggml-sycl/conv2d-dw.hpp"
 #include "ggml-sycl/conv2d-transpose.hpp"
 #include "ggml-sycl/wdecomp.hpp"
+#include "ggml-sycl/moe-group.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/ssm_scan.hpp"
@@ -99,6 +100,7 @@ int g_ggml_sycl_enable_dnn = 1;
 int g_ggml_sycl_dnnl_wdecomp = 1;
 int g_ggml_sycl_q8_1_reuse = 1;
 int g_ggml_sycl_moe_device_routing = 1;
+int g_ggml_sycl_moe_grouped = 1;
 int g_ggml_sycl_fa_onednn = 1;
 int g_ggml_sycl_fa_onednn_max_kv = 0;
 int g_ggml_sycl_enable_mkl_fa = 1;
@@ -408,6 +410,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_dnnl_wdecomp = ggml_sycl_get_env("GGML_SYCL_DNNL_WDECOMP", 1);
         g_ggml_sycl_q8_1_reuse = ggml_sycl_get_env("GGML_SYCL_Q8_1_REUSE", 1);
         g_ggml_sycl_moe_device_routing = ggml_sycl_get_env("GGML_SYCL_MOE_DEVICE_ROUTING", 1);
+        g_ggml_sycl_moe_grouped = ggml_sycl_get_env("GGML_SYCL_MOE_GROUPED", 1);
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
@@ -541,6 +544,7 @@ static void ggml_check_sycl() try {
 
 #ifdef GGML_SYCL_MOE_DEVICE_ROUTING
         GGML_LOG_INFO("  GGML_SYCL_MOE_DEVICE_ROUTING: %d\n", g_ggml_sycl_moe_device_routing);
+        GGML_LOG_INFO("  GGML_SYCL_MOE_GROUPED: %d\n", g_ggml_sycl_moe_grouped);
 #else
         GGML_LOG_INFO("  GGML_SYCL_MOE_DEVICE_ROUTING: disabled by compile flag\n");
 #endif
@@ -5231,6 +5235,14 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
     if (src0->ne[2] > 1) {
         GGML_ASSERT((size_t) size == (size_t) src0->ne[2] * src0->nb[2]);
         switch (src0->type) {
+            case GGML_TYPE_Q4_0:
+                for (int64_t e = 0; e < src0->ne[2]; ++e) {
+                    if (!reorder_qw_q4_0(data_device + e * src0->nb[2], ncols, nrows, src0->nb[2], 0, stream)) {
+                        GGML_ASSERT(e == 0);
+                        return false;
+                    }
+                }
+                return true;
             case GGML_TYPE_Q4_K:
                 return reorder_qw_q4_k_moe(data_device, src0->nb[2], src0->ne[2], stream);
             case GGML_TYPE_Q5_K:
@@ -5327,7 +5339,8 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
         return;
     }
-    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) {
+    if (src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K &&
+        src0->type != GGML_TYPE_Q6_K) {
         return;
     }
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
@@ -5858,6 +5871,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const bool device_routing = ne12 > 1 && ggml_sycl_moe_device_routing(ctx, dst);
     if ((ne12 == 1 || device_routing) && ggml_sycl_src1_prec_allows(dst, GGML_PREC_Q8)) {
         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst, device_routing)) {
+            return;
+        }
+    }
+    if (device_routing && ne12 > ggml_sycl_moe_device_routing_max_tokens(src0->type) && g_ggml_sycl_moe_grouped &&
+        ggml_sycl_moe_grouped_supported(ctx.device, src0, src1) && ggml_sycl_src1_prec_allows(dst, GGML_PREC_F16)) {
+        if (src0->type == GGML_TYPE_Q4_0) {
+            opt_for_reorder_id(&ctx, src0);
+        }
+        const ggml_tensor_extra_gpu * src0_extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+        const bool layout_ok = src0->type != GGML_TYPE_Q4_0 || (src0_extra && src0_extra->optimized_feature.reorder);
+        if (layout_ok && ggml_sycl_moe_grouped(ctx, src0, src1, ids, dst)) {
             return;
         }
     }

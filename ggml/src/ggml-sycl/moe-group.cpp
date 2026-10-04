@@ -1,0 +1,300 @@
+//
+// MIT license
+// Copyright (C) 2025 Intel Corporation
+// SPDX-License-Identifier: MIT
+//
+
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+
+#include "moe-group.hpp"
+#include "iq4nl.hpp"
+
+#if defined(GGML_SYCL_MOE_DEVICE_ROUTING) && \
+    (!defined(GGML_SYCL_XE_FAMILY_AOT) ||    \
+     !(defined(GGML_SYCL_XE_FAMILY_XE_LP) || defined(GGML_SYCL_XE_FAMILY_XE_LPG) || \
+       defined(GGML_SYCL_XE_FAMILY_XE_LPGPLUS) || defined(GGML_SYCL_XE_FAMILY_XE_HPG)))
+#define GGML_SYCL_MOE_GROUP_XMX
+#endif
+
+#ifdef GGML_SYCL_MOE_GROUP_XMX
+
+namespace mx = sycl::ext::oneapi::experimental::matrix;
+
+static constexpr int MOE_BT = 32;
+static constexpr int MOE_BN = 64;
+static constexpr int MOE_KB = 2;
+
+// Q4_0 expert in the per-expert reorder layout: qs[N][K/2] then d[N][K/32].
+struct moe_dq_q4_0 {
+    static constexpr int k_align = QK4_0 * MOE_KB;
+
+    static __dpct_inline__ void block(const uint8_t * slice, int N, int K, int n, int kb, sycl::half2 lo[8],
+                                      sycl::half2 hi[8]) {
+        const int          nb = K / QK4_0;
+        const sycl::uint4  v4 = *(const sycl::uint4 *) (slice + (size_t) n * (K / 2) + (size_t) kb * (QK4_0 / 2));
+        const float        d  = *((const sycl::half *) (slice + (size_t) N * (K / 2)) + (size_t) n * nb + kb);
+        const uint32_t     w[4] = { v4.x(), v4.y(), v4.z(), v4.w() };
+#pragma unroll
+        for (int jp = 0; jp < 8; ++jp) {
+            const uint32_t v = (w[jp / 2] >> (16 * (jp % 2))) & 0xFFFF;
+            lo[jp] = sycl::half2(d * ((int) (v & 0xF) - 8), d * ((int) ((v >> 8) & 0xF) - 8));
+            hi[jp] = sycl::half2(d * ((int) ((v >> 4) & 0xF) - 8), d * ((int) (v >> 12) - 8));
+        }
+    }
+};
+
+// IQ4_XS expert in the standard layout, one 32-element sub-block per call.
+struct moe_dq_iq4_xs {
+    static constexpr int k_align = QK_K;
+
+    static __dpct_inline__ void block(const uint8_t * slice, int /* N */, int K, int n, int kb, sycl::half2 lo[8],
+                                      sycl::half2 hi[8]) {
+        const int            ib = kb % (QK_K / 32);
+        const block_iq4_xs * x  = (const block_iq4_xs *) slice + (size_t) n * (K / QK_K) + kb / (QK_K / 32);
+        const float d = (float) x->d * ((((x->scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x->scales_h >> 2 * ib) & 3) << 4)) - 32);
+        const sycl::uint2 * q = (const sycl::uint2 *) (x->qs + 16 * ib);
+        const sycl::uint2   a = q[0];
+        const sycl::uint2   b = q[1];
+        const uint32_t      w[4] = { a.x(), a.y(), b.x(), b.y() };
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t l = iq4nl_lookup4(w[i] & 0x0F0F0F0F);
+            const uint32_t h = iq4nl_lookup4((w[i] >> 4) & 0x0F0F0F0F);
+            lo[2 * i + 0] = sycl::half2(d * (int8_t) (l >> 0), d * (int8_t) (l >> 8));
+            lo[2 * i + 1] = sycl::half2(d * (int8_t) (l >> 16), d * (int8_t) (l >> 24));
+            hi[2 * i + 0] = sycl::half2(d * (int8_t) (h >> 0), d * (int8_t) (h >> 8));
+            hi[2 * i + 1] = sycl::half2(d * (int8_t) (h >> 16), d * (int8_t) (h >> 24));
+        }
+    }
+};
+
+// One work-group computes MOE_BT routed rows (one tile of one expert) x MOE_BN outputs. Each step dequantizes
+// MOE_KB 32-wide K blocks of the expert's weights into SLM as VNNI-packed fp16 and multiplies them with the
+// gathered fp16 rows on XMX. Tiles past *n_tiles exit, so the grid can be sized from host-known bounds only.
+template <typename dq>
+static void moe_grouped_gemm(const uint8_t * W, size_t expert_stride, const sycl::half * Xh, const int * tile_expert,
+                             const int * tile_row0, const int * tile_rows, const int * n_tiles, const int * sorted_src,
+                             float * dst, int N, int K, int max_tiles, int n_used, size_t dst_slot_stride,
+                             size_t dst_token_stride, dpct::queue_ptr stream) {
+    constexpr int TM = 8, TN = 16, TK = 16;
+    constexpr int SG_N     = MOE_BN / TN;
+    constexpr int SG_T     = 2;
+    constexpr int T_PER_SG = MOE_BT / SG_T;
+    constexpr int MT       = T_PER_SG / TM;
+    constexpr int WG       = SG_N * SG_T * WARP_SIZE;
+    constexpr int KS       = 32 * MOE_KB;
+    static_assert(WARP_SIZE == 16, "the grouped MoE kernel uses 16-wide XMX");
+
+    const int nb32       = K / 32;
+    const int row_groups = (N + MOE_BN - 1) / MOE_BN;
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<sycl::half2, 1> b_tile(sycl::range<1>(KS / 2 * MOE_BN), cgh);
+        sycl::local_accessor<float, 1>       c_tile(sycl::range<1>(MOE_BT * MOE_BN), cgh);
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(max_tiles, row_groups * WG), sycl::range<2>(1, WG)),
+                         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const int tile = it.get_group(0);
+            if (tile >= *n_tiles) {
+                return;
+            }
+            const int       e     = tile_expert[tile];
+            const int       r0    = tile_row0[tile];
+            const int       nrows = tile_rows[tile];
+            const int       n0    = it.get_group(1) * MOE_BN;
+            const auto      sg    = it.get_sub_group();
+            const int       lid   = it.get_local_id(1);
+            const int       sgid  = lid / WARP_SIZE;
+            const int       sg_n  = sgid % SG_N;
+            const int       sg_t  = sgid / SG_N;
+            const uint8_t * slice = W + (size_t) e * expert_stride;
+
+            mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> acc[MT];
+            for (int m = 0; m < MT; ++m) {
+                mx::joint_matrix_fill(sg, acc[m], 0.0f);
+            }
+            auto b_ptr = sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                (sycl::half *) &b_tile[0]);
+
+            for (int kb0 = 0; kb0 < nb32; kb0 += MOE_KB) {
+                for (int i = lid; i < MOE_BN * MOE_KB; i += WG) {
+                    const int   nl  = i % MOE_BN;
+                    const int   kbl = i / MOE_BN;
+                    sycl::half2 lo[8], hi[8];
+                    dq::block(slice, N, K, sycl::min(n0 + nl, N - 1), kb0 + kbl, lo, hi);
+#pragma unroll
+                    for (int jp = 0; jp < 8; ++jp) {
+                        b_tile[(kbl * 16 + jp) * MOE_BN + nl]     = lo[jp];
+                        b_tile[(kbl * 16 + 8 + jp) * MOE_BN + nl] = hi[jp];
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+#pragma unroll
+                for (int ks = 0; ks < KS / TK; ++ks) {
+                    mx::joint_matrix<sycl::sub_group, sycl::half, mx::use::b, TK, TN, mx::layout::ext_intel_packed> mb;
+                    mx::joint_matrix_load(sg, mb, b_ptr + (ks * TK / 2) * (2 * MOE_BN) + 2 * (sg_n * TN), 2 * MOE_BN);
+#pragma unroll
+                    for (int m = 0; m < MT; ++m) {
+                        mx::joint_matrix<sycl::sub_group, sycl::half, mx::use::a, TM, TK, mx::layout::row_major> ma;
+                        const sycl::half * ap = Xh + (size_t) (r0 + sg_t * T_PER_SG + m * TM) * K + kb0 * 32 + ks * TK;
+                        mx::joint_matrix_load(
+                            sg, ma,
+                            sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(ap),
+                            K);
+                        mx::joint_matrix_mad(sg, acc[m], ma, mb, acc[m]);
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            auto c_ptr = c_tile.template get_multi_ptr<sycl::access::decorated::no>();
+            for (int m = 0; m < MT; ++m) {
+                mx::joint_matrix_store(sg, acc[m], c_ptr + (sg_t * T_PER_SG + m * TM) * MOE_BN + sg_n * TN, MOE_BN,
+                                       mx::layout::row_major);
+            }
+            sycl::group_barrier(it.get_group());
+            for (int i = lid; i < MOE_BT * MOE_BN; i += WG) {
+                const int t  = i / MOE_BN;
+                const int nl = i % MOE_BN;
+                if (t < nrows && n0 + nl < N) {
+                    const int src = sorted_src[r0 + t];
+                    dst[(size_t) (src / n_used) * dst_token_stride + (size_t) (src % n_used) * dst_slot_stride + n0 + nl] =
+                        c_tile[i];
+                }
+            }
+        });
+    });
+}
+
+#endif
+
+bool ggml_sycl_moe_grouped_supported(int device, const ggml_tensor * src0, const ggml_tensor * src1) {
+#ifdef GGML_SYCL_MOE_GROUP_XMX
+    const sycl_xe_family family = ggml_sycl_info().devices[device].hw_info.xe_family;
+    if (get_xe_family_caps(family).dpas_n != 16 || !is_xe_family_compiled(family)) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src0->ne[3] != 1) {
+        return false;
+    }
+    switch (src0->type) {
+        case GGML_TYPE_Q4_0:
+            return src0->ne[0] % moe_dq_q4_0::k_align == 0 && src0->nb[2] % 16 == 0;
+        case GGML_TYPE_IQ4_XS:
+            return src0->ne[0] % moe_dq_iq4_xs::k_align == 0 && src0->nb[2] % 8 == 0;
+        default:
+            return false;
+    }
+#else
+    GGML_UNUSED(device);
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    return false;
+#endif
+}
+
+bool ggml_sycl_moe_grouped(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                           const ggml_tensor * ids, ggml_tensor * dst) {
+#ifdef GGML_SYCL_MOE_GROUP_XMX
+    const int64_t n_as     = src0->ne[2];
+    const int     N        = (int) src0->ne[1];
+    const int     K        = (int) src0->ne[0];
+    const int     n_used   = (int) ids->ne[0];
+    const int     n_tokens = (int) ids->ne[1];
+    const int64_t ne11     = src1->ne[1];
+    const int     R        = n_tokens * n_used;
+
+    int scan_wg = 1;
+    while (scan_wg < n_as) {
+        scan_wg *= 2;
+    }
+    if (scan_wg > (int) ggml_sycl_info().max_work_group_sizes[ctx.device] || ids->nb[0] != sizeof(int32_t) ||
+        (ne11 != 1 && ne11 != n_used) || src1->ne[2] != n_tokens || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const queue_ptr stream    = ctx.stream();
+    const int       max_tiles = (R + MOE_BT - 1) / MOE_BT + (int) n_as;
+
+    ggml_sycl_pool_alloc<int>        counts(ctx.pool(), n_as);
+    ggml_sycl_pool_alloc<int>        cursor(ctx.pool(), n_as);
+    ggml_sycl_pool_alloc<int>        tiles(ctx.pool(), (size_t) 3 * max_tiles + 1);
+    ggml_sycl_pool_alloc<int>        sorted_src(ctx.pool(), R);
+    ggml_sycl_pool_alloc<sycl::half> xh(ctx.pool(), (size_t) (R + MOE_BT) * K);
+
+    int *        cnt       = counts.get();
+    int *        cur       = cursor.get();
+    int *        t_expert  = tiles.get();
+    int *        t_row0    = t_expert + max_tiles;
+    int *        t_rows    = t_row0 + max_tiles;
+    int *        n_tiles   = t_rows + max_tiles;
+    int *        srt       = sorted_src.get();
+    sycl::half * x16       = xh.get();
+    const char * ids_d     = (const char *) ids->data;
+    const size_t ids_nb1   = ids->nb[1];
+    const int    n_as_i    = (int) n_as;
+
+    stream->memset(cnt, 0, n_as * sizeof(int));
+    stream->parallel_for(sycl::range<1>(R), [=](sycl::id<1> i) {
+        const int e = *(const int32_t *) (ids_d + (i / n_used) * ids_nb1 + (i % n_used) * sizeof(int32_t));
+        sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device> c(cnt[e]);
+        c.fetch_add(1);
+    });
+    stream->parallel_for(sycl::nd_range<1>(scan_wg, scan_wg), [=](sycl::nd_item<1> it) {
+        const int e    = it.get_local_id(0);
+        const int c    = e < n_as_i ? cnt[e] : 0;
+        const int nt   = (c + MOE_BT - 1) / MOE_BT;
+        const int off  = sycl::exclusive_scan_over_group(it.get_group(), c, sycl::plus<int>());
+        const int toff = sycl::exclusive_scan_over_group(it.get_group(), nt, sycl::plus<int>());
+        if (e < n_as_i) {
+            cur[e] = off;
+            for (int j = 0; j < nt; ++j) {
+                t_expert[toff + j] = e;
+                t_row0[toff + j]   = off + j * MOE_BT;
+                t_rows[toff + j]   = sycl::min(MOE_BT, c - j * MOE_BT);
+            }
+        }
+        if (e == scan_wg - 1) {
+            *n_tiles = toff + nt;
+        }
+    });
+    stream->parallel_for(sycl::range<1>(R), [=](sycl::id<1> i) {
+        const int e = *(const int32_t *) (ids_d + (i / n_used) * ids_nb1 + (i % n_used) * sizeof(int32_t));
+        sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device> c(cur[e]);
+        srt[c.fetch_add(1)] = (int) i;
+    });
+
+    const char * src1_d   = (const char *) src1->data;
+    const size_t nb11     = ne11 == 1 ? 0 : src1->nb[1];
+    const size_t nb12     = src1->nb[2];
+    const int    k8       = K / 8;
+    stream->parallel_for(sycl::range<1>((size_t) R * k8), [=](sycl::id<1> idx) {
+        const int    row = idx / k8;
+        const int    c   = idx % k8;
+        const int    src = srt[row];
+        const float * xr = (const float *) (src1_d + (size_t) (src / n_used) * nb12 + (size_t) (src % n_used) * nb11) + c * 8;
+        const sycl::vec<float, 8> v = *(const sycl::vec<float, 8> *) xr;
+        *(sycl::vec<sycl::half, 8> *) (x16 + (size_t) row * K + c * 8) = v.convert<sycl::half, sycl::rounding_mode::rte>();
+    });
+
+    const uint8_t * W = (const uint8_t *) src0->data;
+    if (src0->type == GGML_TYPE_Q4_0) {
+        moe_grouped_gemm<moe_dq_q4_0>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt, (float *) dst->data,
+                                      N, K, max_tiles, n_used, dst->nb[1] / sizeof(float), dst->nb[2] / sizeof(float),
+                                      stream);
+    } else {
+        moe_grouped_gemm<moe_dq_iq4_xs>(W, src0->nb[2], x16, t_expert, t_row0, t_rows, n_tiles, srt,
+                                        (float *) dst->data, N, K, max_tiles, n_used, dst->nb[1] / sizeof(float),
+                                        dst->nb[2] / sizeof(float), stream);
+    }
+    return true;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}

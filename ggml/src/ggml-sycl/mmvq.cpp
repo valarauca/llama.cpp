@@ -3965,16 +3965,76 @@ static bool reorder_mul_mat_vec_q4_0_q8_1_glu_switch_ncols(const void * vx, cons
     }
 }
 
+template <ggml_type type>
+static bool reorder_mul_mat_vec_glu_switch_ncols(const void * vx, const void * vgate, const void * vy, float * dst,
+                                                 int ncols, int nrows, int ncols_dst, int stride_col_y_bytes,
+                                                 int stride_col_dst, ggml_glu_op glu_op, dpct::queue_ptr stream) {
+    using vec_dot = reorder_vec_dot_q_sycl<type>;
+    switch (ncols_dst) {
+        case 1: launch_mul_mat_vec_q_reorder_glu<vec_dot, 1>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 2: launch_mul_mat_vec_q_reorder_glu<vec_dot, 2>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 3: launch_mul_mat_vec_q_reorder_glu<vec_dot, 3>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 4: launch_mul_mat_vec_q_reorder_glu<vec_dot, 4>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 5: launch_mul_mat_vec_q_reorder_glu<vec_dot, 5>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 6: launch_mul_mat_vec_q_reorder_glu<vec_dot, 6>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 7: launch_mul_mat_vec_q_reorder_glu<vec_dot, 7>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        case 8: launch_mul_mat_vec_q_reorder_glu<vec_dot, 8>(vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream); return true;
+        default: return false;
+    }
+}
+
+bool ggml_sycl_mul_mat_vec_q_glu_reorder_supports(enum ggml_type src0_type) {
+    switch (src0_type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu_op glu_op, const void * vx,
                                          const void * vgate, const void * vy, float * dst, int ncols, int nrows,
                                          int ncols_dst, int stride_col_y_bytes, int stride_col_dst,
                                          dpct::queue_ptr stream) {
-    if (src0_type != GGML_TYPE_Q4_K && src0_type != GGML_TYPE_Q4_0) {
+    if (!ggml_sycl_mul_mat_vec_q_glu_reorder_supports(src0_type)) {
         return false;
     }
     if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
         return false;
     }
+#define GLU_SWITCH(T) \
+    case T: return reorder_mul_mat_vec_glu_switch_ncols<T>(vx, vgate, vy, dst, ncols, nrows, ncols_dst, stride_col_y_bytes, stride_col_dst, glu_op, stream)
+    switch (src0_type) {
+        GLU_SWITCH(GGML_TYPE_Q8_0);
+        GLU_SWITCH(GGML_TYPE_Q2_K);
+        GLU_SWITCH(GGML_TYPE_Q3_K);
+        GLU_SWITCH(GGML_TYPE_Q5_K);
+        GLU_SWITCH(GGML_TYPE_Q6_K);
+        GLU_SWITCH(GGML_TYPE_IQ1_S);
+        GLU_SWITCH(GGML_TYPE_IQ1_M);
+        GLU_SWITCH(GGML_TYPE_IQ2_XXS);
+        GLU_SWITCH(GGML_TYPE_IQ2_XS);
+        GLU_SWITCH(GGML_TYPE_IQ2_S);
+        GLU_SWITCH(GGML_TYPE_IQ3_XXS);
+        GLU_SWITCH(GGML_TYPE_IQ3_S);
+        GLU_SWITCH(GGML_TYPE_IQ4_NL);
+        default: break;
+    }
+#undef GLU_SWITCH
     if (src0_type == GGML_TYPE_Q4_0) {
         return reorder_mul_mat_vec_q4_0_q8_1_glu_switch_ncols(vx, vgate, vy, dst, ncols, nrows, ncols_dst,
                                                               stride_col_y_bytes, stride_col_dst, glu_op, stream);

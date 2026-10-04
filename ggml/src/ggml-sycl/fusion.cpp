@@ -1,5 +1,6 @@
 #include "fusion.hpp"
 #include "binbcast.hpp"
+#include "mmvq.hpp"
 
 #include <algorithm>
 
@@ -32,9 +33,9 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
         return false;
     }
 
-    // fused GEMVs walk whole QK_K super-blocks: the reorder kernel covers same-type
-    // q4_0 / q4_K, the plain-layout kernel covers q5_K / iq4_xs pairs incl. mixed gate/up types
-    const bool reorder_pair = wu->type == wg->type && (wu->type == GGML_TYPE_Q4_0 || wu->type == GGML_TYPE_Q4_K);
+    // fused GEMVs walk whole QK_K super-blocks: the reorder kernel covers same-type pairs of every
+    // reorder-layout type, the plain-layout kernel covers q5_K / iq4_xs pairs incl. mixed gate/up types
+    const bool reorder_pair = wu->type == wg->type && ggml_sycl_mul_mat_vec_q_glu_reorder_supports(wu->type);
     const bool plain_pair   = (wu->type == GGML_TYPE_Q5_K || wu->type == GGML_TYPE_IQ4_XS) &&
                             (wg->type == GGML_TYPE_Q5_K || wg->type == GGML_TYPE_IQ4_XS);
     if ((!reorder_pair && !plain_pair) || wu->ne[0] % QK_K != 0) {

@@ -5494,10 +5494,15 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
         return false;
     }
 
-    // quant pairs the reorder kernel cannot serve (mixed gate/up types) take the
-    // standard-layout fused path instead; q4_0 and q4_K keep the reorder path below
-    if (wg->type != wu->type || (wu->type != GGML_TYPE_Q4_0 && wu->type != GGML_TYPE_Q4_K)) {
+    // quant pairs the reorder kernel cannot serve (mixed gate/up types, iq4_xs) take the
+    // standard-layout fused path instead; same-type reorder-layout pairs take the reorder path below
+    if (wg->type != wu->type || !ggml_sycl_mul_mat_vec_q_glu_reorder_supports(wu->type)) {
         return ggml_sycl_mul_mat_glu_mmvq_plain(ctx, glu, gate, up, wu, wg, act);
+    }
+
+    if (act->ne[1] == 1 && wu->type != GGML_TYPE_Q4_K && g_ggml_sycl_enable_esimd &&
+        ggml_sycl_supports_reorder_esimd(wu->type)) {
+        return wu->type == GGML_TYPE_Q5_K && ggml_sycl_mul_mat_glu_mmvq_plain(ctx, glu, gate, up, wu, wg, act);
     }
 
     // install the reorder (SoA) layout the fused kernel needs, as the unfused mmvq path would;

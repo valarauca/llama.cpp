@@ -6793,6 +6793,51 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// Matches the get_rows that gathers a single sequence's recurrent state out of the cache for a gated delta net
+// that also takes the cache fusion. The get_rows can then be skipped: the kernel reads the cache rows through the
+// same index, and since every work item loads its state slice before storing it, reading and writing one cache
+// row in place is safe. Returns the gated delta net node index, or -1. The get_rows result must feed only that
+// node (through at most a reshape) up to it, and is taken to have no readers after it, as in every graph that
+// builds this pattern.
+static int ggml_sycl_try_gdn_state_gather(const ggml_cgraph * cgraph, int node_idx,
+                                          ggml_sycl_gated_delta_net_fused_cache & fused) {
+    if (!g_ggml_sycl_enable_fusion) {
+        return -1;
+    }
+    const ggml_tensor * gr = cgraph->nodes[node_idx];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || gr->src[0]->type != GGML_TYPE_F32 ||
+        gr->src[1]->type != GGML_TYPE_I32 || gr->ne[1] != 1 || gr->ne[2] != 1 || gr->ne[3] != 1 ||
+        gr->src[0]->nb[0] != sizeof(float) || gr->src[0]->ne[0] != gr->ne[0] || (gr->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    const ggml_tensor * reshape = nullptr;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && j <= node_idx + 64; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_GATED_DELTA_NET && (n->src[5] == gr || (reshape && n->src[5] == reshape))) {
+            const ggml_tensor * v = n->src[2];
+            if (v->ne[3] != 1 || v->ne[0] * v->ne[0] * v->ne[1] != gr->ne[0] ||
+                ggml_sycl_try_gdn_cache_fusion(cgraph, j, fused) == 0) {
+                return -1;
+            }
+            fused.state_src        = (const float *) gr->src[0]->data;
+            fused.state_idx        = (const int32_t *) gr->src[1]->data;
+            fused.state_row_stride = (int64_t) (gr->src[0]->nb[1] / sizeof(float));
+            return j;
+        }
+        if (n->op == GGML_OP_RESHAPE && n->src[0] == gr && reshape == nullptr && !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            reshape = n;
+            continue;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = n->src[k];
+            if (s && (s == gr || (reshape && s == reshape) || s->view_src == gr)) {
+                return -1;
+            }
+        }
+    }
+    return -1;
+}
+
 // Drops the cached q8_1 src1 if any node in (checked, upto] writes into the activation it was built from.
 static void ggml_sycl_q8_1_cache_note_writes(ggml_sycl_q8_1_cache & qc, const ggml_cgraph * cgraph, int & checked,
                                              int upto) {
@@ -6815,6 +6860,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
     sycl_ctx->q8_1_cache.src = nullptr;
     int q8_1_checked = -1;
+    const ggml_tensor *                   gdn_state_node = nullptr;
+    ggml_sycl_gated_delta_net_fused_cache gdn_state;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -6839,10 +6886,33 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+        if (node->op == GGML_OP_MUL_MAT) {
+            const int gate_nodes_to_skip = ggml_sycl_try_gdn_gate_proj_fusion(*sycl_ctx, cgraph, i);
+            if (gate_nodes_to_skip > 0) {
+                i += gate_nodes_to_skip;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_GET_ROWS) {
+            ggml_sycl_gated_delta_net_fused_cache gathered;
+            const int gdn_idx = ggml_sycl_try_gdn_state_gather(cgraph, i, gathered);
+            if (gdn_idx > 0) {
+                gdn_state_node = cgraph->nodes[gdn_idx];
+                gdn_state      = gathered;
+                continue;
+            }
+        }
         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
         if (node->op == GGML_OP_GATED_DELTA_NET) {
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
+            if (node == gdn_state_node) {
+                GGML_ASSERT(gdn_nodes_to_skip > 0);
+                fused_state_cpy.state_src        = gdn_state.state_src;
+                fused_state_cpy.state_idx        = gdn_state.state_idx;
+                fused_state_cpy.state_row_stride = gdn_state.state_row_stride;
+                gdn_state_node                   = nullptr;
+            }
             if (gdn_nodes_to_skip > 0) {
                 ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
                 i += gdn_nodes_to_skip;

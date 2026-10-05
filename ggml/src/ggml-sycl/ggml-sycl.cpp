@@ -5789,13 +5789,12 @@ static bool ggml_sycl_moe_device_routing(ggml_backend_sycl_context & ctx, const 
 #endif
 }
 
-// Largest batch the device-routed MoE GEMV takes. It reads an expert's weights once per token that picks it,
-// while the host-routed path reads each picked expert once, so types whose host-path kernels are already fast
-// lose once real routing repeats experts: Qwen3-Coder-30B-A3B Q4_0 pp4 +6%, pp6 -1%, pp8 -5%, and Q8_0 is even
-// at 8 tokens on the op level. The other types still win at 8 (Coder IQ4_XS pp8 +38%, op level Q4_K, Q5_K,
-// Q6_K and IQ4_XS 55-82% faster).
+// Largest batch the device-routed MoE GEMV takes. Up to the GEMV's own limit it beats the grouped XMX kernel for
+// every grouped type: real routing at pp2-pp8 is 40-60% faster on Qwen3-Coder-30B-A3B Q4_0 and IQ4_XS and
+// Gemma-4 26B-A4B, and at 8 tokens on the op level Q8_0 takes 204 us vs 258, Q4_K 119 vs 264.
 static int64_t ggml_sycl_moe_device_routing_max_tokens(ggml_type type) {
-    return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 ? 4 : MMVQ_MAX_BATCH_SIZE;
+    GGML_UNUSED(type);
+    return MMVQ_MAX_BATCH_SIZE;
 }
 
 static bool ggml_sycl_mul_mat_id_mmvq_fused(

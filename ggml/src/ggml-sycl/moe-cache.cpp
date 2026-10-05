@@ -33,12 +33,14 @@ static int ggml_sycl_moe_cache_slots() {
 struct moe_cache_member {
     const ggml_tensor *     tensor = nullptr;
     ggml_backend_buffer_t   pool   = nullptr;
-    ggml_tensor_extra_gpu * extra  = nullptr;
-    bool                    used   = false;
+    ggml_tensor_extra_gpu * extra       = nullptr;
+    size_t                  scratch_off = 0;
+    bool                    used        = false;
 };
 
 // The cached expert tensors of one layer. They share routing, so they share one LRU over the slots, and the
-// first of them to run in a graph plans for all of them.
+// first of them to run in a graph plans for all of them. A batch routed to more experts than there are slots is
+// staged instead: its experts are packed into the device scratch and the LRU is left alone.
 struct moe_cache_group {
     int                           layer    = -1;
     int64_t                       n_expert = 0;
@@ -48,19 +50,26 @@ struct moe_cache_group {
     std::vector<int32_t>          expert_of_slot;
     std::vector<uint64_t>         last_used;
     uint64_t                      tick     = 0;
+    bool                          staged   = false;
+    int64_t                       n_packed = 0;
     const void *                  plan_ids = nullptr;
     ggml_backend_buffer_t         ids_buf  = nullptr;
     int32_t *                     ids_host = nullptr;
     size_t                        ids_cap  = 0;
 };
 
-// Per-device registry of groups plus counters reported when the last cached tensor is freed.
+// Per-device registry of groups, the staging scratch they share (sized for the largest group, used one layer at
+// a time on the in-order queue) and counters reported when the last cached tensor is freed.
 struct moe_cache_device {
     std::vector<std::unique_ptr<moe_cache_group>> groups;
-    uint64_t                                      ops       = 0;
-    uint64_t                                      hits      = 0;
-    uint64_t                                      misses    = 0;
-    uint64_t                                      bytes_h2d = 0;
+    ggml_backend_buffer_t                         scratch     = nullptr;
+    size_t                                        scratch_cap = 0;
+    uint64_t                                      ops         = 0;
+    uint64_t                                      staged_ops  = 0;
+    uint64_t                                      hits        = 0;
+    uint64_t                                      misses      = 0;
+    uint64_t                                      bytes_h2d   = 0;
+    uint64_t                                      bytes_d2d   = 0;
 };
 
 static std::mutex       g_moe_cache_mutex;
@@ -141,11 +150,26 @@ static void moe_cache_register(int device, const ggml_tensor * tensor) {
         g->last_used.assign(g->n_slots, 0);
     }
 
+    const size_t     pad = ggml_row_size(tensor->type, MATRIX_ROW_PADDING);
     moe_cache_member m;
     m.tensor = tensor;
-    m.pool   = moe_cache_device_alloc(device, g->n_slots * tensor->nb[2] + ggml_row_size(tensor->type, MATRIX_ROW_PADDING));
+    m.pool   = moe_cache_device_alloc(device, g->n_slots * tensor->nb[2] + pad);
     m.extra  = new ggml_tensor_extra_gpu{};
     g->members.push_back(m);
+
+    size_t need = 0;
+    for (moe_cache_member & it : g->members) {
+        it.scratch_off = need;
+        need += GGML_PAD(g->n_expert * it.tensor->nb[2] + ggml_row_size(it.tensor->type, MATRIX_ROW_PADDING),
+                         MOE_CACHE_ALIGNMENT);
+    }
+    if (need > mc.scratch_cap) {
+        if (mc.scratch) {
+            ggml_backend_buffer_free(mc.scratch);
+        }
+        mc.scratch     = moe_cache_device_alloc(device, need);
+        mc.scratch_cap = need;
+    }
 }
 
 static void moe_cache_unregister(int device, const ggml_tensor * tensor) {
@@ -169,12 +193,19 @@ static void moe_cache_unregister(int device, const ggml_tensor * tensor) {
                 }
                 mc.groups.erase(mc.groups.begin() + gi);
             }
-            if (mc.groups.empty() && mc.ops > 0) {
-                GGML_LOG_INFO("%s: SYCL%d MoE cache: %llu ops, %llu expert hits, %llu misses (%.1f%% hit), %.2f GiB copied\n",
-                              __func__, device, (unsigned long long) mc.ops, (unsigned long long) mc.hits,
-                              (unsigned long long) mc.misses, 100.0 * mc.hits / std::max<uint64_t>(1, mc.hits + mc.misses),
-                              mc.bytes_h2d / double(1ull << 30));
-                mc.ops = mc.hits = mc.misses = mc.bytes_h2d = 0;
+            if (mc.groups.empty()) {
+                if (mc.ops > 0) {
+                    GGML_LOG_INFO("%s: SYCL%d MoE cache: %llu ops (%llu staged), %llu expert hits, %llu misses (%.1f%% hit), "
+                                  "%.2f GiB host to device, %.2f GiB device to device\n",
+                                  __func__, device, (unsigned long long) mc.ops, (unsigned long long) mc.staged_ops,
+                                  (unsigned long long) mc.hits, (unsigned long long) mc.misses,
+                                  100.0 * mc.hits / std::max<uint64_t>(1, mc.hits + mc.misses),
+                                  mc.bytes_h2d / double(1ull << 30), mc.bytes_d2d / double(1ull << 30));
+                }
+                if (mc.scratch) {
+                    ggml_backend_buffer_free(mc.scratch);
+                }
+                mc = moe_cache_device{};
             }
             return;
         }
@@ -331,43 +362,46 @@ bool ggml_backend_buffer_is_sycl_moe(ggml_backend_buffer_t buffer) {
     return buffer != nullptr && buffer->buft->iface.get_name == moe_cache_buft_get_name;
 }
 
-// Reads the layer's routing on the host and gives every routed expert a slot. The queue is drained before the
-// ids are copied back: reading them right behind the routing kernels returned stale ids in about one of three
-// Coder IQ4_XS decode runs, a race standalone tests of the same queue pattern did not reproduce.
-static void moe_cache_plan(ggml_backend_sycl_context & ctx, moe_cache_device & mc, moe_cache_group & g,
-                           const ggml_tensor * ids, ggml_sycl_moe_cache_reorder_t reorder) {
-    const queue_ptr stream = ctx.stream();
-    for (moe_cache_member & m : g.members) {
-        reorder(&ctx, m.tensor);
-        m.used = false;
+// Packs the experts of a batch routed to more experts than there are slots into the scratch, in expert order,
+// copying resident experts from their slots and the rest from host memory in contiguous runs.
+static void moe_cache_stage(queue_ptr stream, moe_cache_device & mc, moe_cache_group & g, std::vector<int32_t> & need,
+                            std::vector<int32_t> & packed) {
+    std::sort(need.begin(), need.end());
+    g.n_packed = (int64_t) need.size();
+    packed.assign(g.n_expert, -1);
+    for (size_t p = 0; p < need.size(); ++p) {
+        packed[need[p]] = (int32_t) p;
     }
-
-    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
-    const int64_t     n_used   = ids->ne[0];
-    const int64_t     n_tokens = ids->ne[1];
-    const size_t      n        = n_used * n_tokens;
-    std::vector<char> ids_raw(ggml_nbytes(ids));
-    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
-    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(ids_raw.data(), ids->data, ids_raw.size()).wait()));
-    auto id_at = [&](int64_t t, int64_t u) {
-        return *(const int32_t *) (ids_raw.data() + t * ids->nb[1] + u * ids->nb[0]);
-    };
-
-    std::vector<int32_t> need;
-    std::vector<uint8_t> seen(g.n_expert, 0);
-    for (int64_t t = 0; t < n_tokens; ++t) {
-        for (int64_t u = 0; u < n_used; ++u) {
-            const int32_t e = id_at(t, u);
-            GGML_ASSERT(e >= 0 && e < g.n_expert);
-            if (!seen[e]) {
-                seen[e] = 1;
-                need.push_back(e);
+    char * scratch = (char *) ggml_backend_buffer_get_base(mc.scratch);
+    for (const moe_cache_member & m : g.members) {
+        const size_t nb2  = m.tensor->nb[2];
+        char *       base = scratch + m.scratch_off;
+        const char * pool = (const char *) ggml_backend_buffer_get_base(m.pool);
+        const char * host = (const char *) m.tensor->data;
+        for (size_t p = 0; p < need.size();) {
+            const int32_t e = need[p];
+            if (g.slot_of_expert[e] >= 0) {
+                SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(base + p * nb2, pool + g.slot_of_expert[e] * nb2, nb2)));
+                mc.bytes_d2d += nb2;
+                p++;
+                continue;
             }
+            size_t run = 1;
+            while (p + run < need.size() && need[p + run] == e + (int32_t) run && g.slot_of_expert[need[p + run]] < 0) {
+                run++;
+            }
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(base + p * nb2, host + e * nb2, run * nb2)));
+            mc.bytes_h2d += run * nb2;
+            p += run;
         }
     }
-    GGML_ASSERT((int) need.size() <= g.n_slots);
+    mc.staged_ops++;
+}
 
-    g.tick++;
+// Gives every expert of the batch a slot, evicting the least recently used experts not needed by this batch,
+// and copies the missing ones from host memory.
+static void moe_cache_assign(queue_ptr stream, moe_cache_device & mc, moe_cache_group & g,
+                             const std::vector<int32_t> & need) {
     for (const int32_t e : need) {
         if (g.slot_of_expert[e] >= 0) {
             g.last_used[g.slot_of_expert[e]] = g.tick;
@@ -399,6 +433,51 @@ static void moe_cache_plan(ggml_backend_sycl_context & ctx, moe_cache_device & m
             mc.bytes_h2d += nb2;
         }
     }
+}
+
+// Reads the layer's routing on the host and either gives every routed expert a slot or, when the batch needs
+// more experts than there are slots, stages them. The queue is drained before the ids are copied back: reading
+// them right behind the routing kernels returned stale ids in about one of three Coder IQ4_XS decode runs, a
+// race standalone tests of the same queue pattern did not reproduce.
+static void moe_cache_plan(ggml_backend_sycl_context & ctx, moe_cache_device & mc, moe_cache_group & g,
+                           const ggml_tensor * ids, ggml_sycl_moe_cache_reorder_t reorder) {
+    const queue_ptr stream = ctx.stream();
+    for (moe_cache_member & m : g.members) {
+        reorder(&ctx, m.tensor);
+        m.used = false;
+    }
+
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
+    const int64_t     n_used   = ids->ne[0];
+    const int64_t     n_tokens = ids->ne[1];
+    const size_t      n        = n_used * n_tokens;
+    std::vector<char> ids_raw(ggml_nbytes(ids));
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(ids_raw.data(), ids->data, ids_raw.size()).wait()));
+    auto id_at = [&](int64_t t, int64_t u) {
+        return *(const int32_t *) (ids_raw.data() + t * ids->nb[1] + u * ids->nb[0]);
+    };
+
+    std::vector<int32_t> need;
+    std::vector<uint8_t> seen(g.n_expert, 0);
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t u = 0; u < n_used; ++u) {
+            const int32_t e = id_at(t, u);
+            GGML_ASSERT(e >= 0 && e < g.n_expert);
+            if (!seen[e]) {
+                seen[e] = 1;
+                need.push_back(e);
+            }
+        }
+    }
+    std::vector<int32_t> packed;
+    g.tick++;
+    g.staged = (int) need.size() > g.n_slots;
+    if (g.staged) {
+        moe_cache_stage(stream, mc, g, need, packed);
+    } else {
+        moe_cache_assign(stream, mc, g, need);
+    }
 
     if (g.ids_cap < n) {
         SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
@@ -413,9 +492,10 @@ static void moe_cache_plan(ggml_backend_sycl_context & ctx, moe_cache_device & m
         GGML_ASSERT(g.ids_host != nullptr);
         g.ids_cap = n;
     }
+    const std::vector<int32_t> & remap = g.staged ? packed : g.slot_of_expert;
     for (int64_t t = 0; t < n_tokens; ++t) {
         for (int64_t u = 0; u < n_used; ++u) {
-            g.ids_host[t * n_used + u] = g.slot_of_expert[id_at(t, u)];
+            g.ids_host[t * n_used + u] = remap[id_at(t, u)];
         }
     }
     SYCL_CHECK(CHECK_TRY_ERROR(
@@ -454,11 +534,17 @@ void ggml_sycl_moe_cache_prepare(ggml_backend_sycl_context & ctx, const ggml_ten
     const bool                    reordered  = host_extra && host_extra->optimized_feature.reorder;
     m.extra->optimized_feature.reorder       = reordered;
 
-    src0_view           = *src0;
-    src0_view.data      = ggml_backend_buffer_get_base(m.pool);
-    src0_view.buffer    = m.pool;
-    src0_view.ne[2]     = g->n_slots;
-    src0_view.nb[3]     = src0->nb[2] * g->n_slots;
+    src0_view = *src0;
+    if (g->staged) {
+        src0_view.data   = (char *) ggml_backend_buffer_get_base(mc.scratch) + m.scratch_off;
+        src0_view.buffer = mc.scratch;
+        src0_view.ne[2]  = g->n_packed;
+    } else {
+        src0_view.data   = ggml_backend_buffer_get_base(m.pool);
+        src0_view.buffer = m.pool;
+        src0_view.ne[2]  = g->n_slots;
+    }
+    src0_view.nb[3]     = src0->nb[2] * src0_view.ne[2];
     src0_view.extra     = reordered ? m.extra : nullptr;
     src0_view.view_src  = nullptr;
     src0_view.view_offs = 0;

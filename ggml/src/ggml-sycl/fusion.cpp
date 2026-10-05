@@ -85,7 +85,8 @@ static bool ggml_sycl_should_fuse_rope_set_rows(const ggml_tensor * rope, const 
         return false;
     }
     const int mode = ggml_get_op_params_i32(rope, 2);
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX && mode != GGML_ROPE_TYPE_MROPE &&
+        mode != GGML_ROPE_TYPE_IMROPE) {
         return false;
     }
 

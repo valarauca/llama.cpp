@@ -76,6 +76,7 @@
 #include "ggml-sycl/conv2d-transpose.hpp"
 #include "ggml-sycl/wdecomp.hpp"
 #include "ggml-sycl/moe-group.hpp"
+#include "ggml-sycl/moe-cache.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/ssm_scan.hpp"
@@ -5381,6 +5382,23 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
     if (!extra || extra->optimized_feature.reorder) {
         return;
     }
+    if (ggml_backend_buffer_is_host(src0->buffer)) {
+        const size_t             size = ggml_nbytes(src0);
+        sycl_reorder_temp_buffer staging(ctx->stream(), size);
+        if (!staging) {
+            return;
+        }
+        SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream()->memcpy(staging.ptr, src0->data, size)));
+        ggml_tensor staged = *src0;
+        staged.data        = staging.ptr;
+        if (!reorder_qw(&staged, ctx->stream())) {
+            return;
+        }
+        SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream()->memcpy(src0->data, staging.ptr, size).wait()));
+        extra->optimized_feature.reorder = true;
+        g_ggml_sycl_graph_epoch.fetch_add(1);
+        return;
+    }
     if (reorder_qw(src0, ctx->stream())) {
         extra->optimized_feature.reorder = true;
         g_ggml_sycl_graph_epoch.fetch_add(1);
@@ -5893,6 +5911,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0 = dst->src[0];
     const ggml_tensor *src1 = dst->src[1];
     GGML_ASSERT(!ggml_backend_buffer_is_sycl_split(src0->buffer) && "mul_mat_id does not support split buffers");
+
+    if (ggml_backend_buffer_is_sycl_moe(src0->buffer)) {
+        ggml_tensor src0_view;
+        ggml_tensor ids_view;
+        ggml_sycl_moe_cache_prepare(ctx, dst, opt_for_reorder_id, src0_view, ids_view);
+        ggml_tensor dst_view = *dst;
+        dst_view.src[0]      = &src0_view;
+        dst_view.src[2]      = &ids_view;
+        ggml_sycl_mul_mat_id(ctx, &dst_view);
+        return;
+    }
 
     const ggml_tensor *ids = dst->src[2];
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -7648,6 +7677,9 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
 }
 
 static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    if (buft == ggml_backend_sycl_moe_buffer_type(((ggml_backend_sycl_device_context *) dev->context)->device)) {
+        return true;
+    }
     if (buft->iface.get_name != ggml_backend_sycl_buffer_type_get_name) {
         return false;
     }
@@ -8033,11 +8065,25 @@ bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tens
 catch (const sycl::exception &) { return false; }
 catch (...)                     { return false; }
 
+static ggml_backend_buffer_type_t * ggml_backend_sycl_device_get_extra_bufts(ggml_backend_dev_t dev) {
+    static std::vector<std::array<ggml_backend_buffer_type_t, 2>> extra = [] {
+        std::vector<std::array<ggml_backend_buffer_type_t, 2>> v(ggml_backend_sycl_get_device_count());
+        for (size_t i = 0; i < v.size(); ++i) {
+            v[i] = { ggml_backend_sycl_moe_buffer_type((int) i), nullptr };
+        }
+        return v;
+    }();
+    return extra[((ggml_backend_sycl_device_context *) dev->context)->device].data();
+}
+
 static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, const char *name) {
     GGML_UNUSED(reg);
 
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *)ggml_backend_sycl_split_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *)ggml_backend_sycl_device_get_extra_bufts;
     }
 
     // Tensor parallelism (--split-mode tensor) entry points.

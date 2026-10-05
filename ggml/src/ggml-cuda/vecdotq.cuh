@@ -122,18 +122,16 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
 
 #pragma unroll
     for (int i = 0; i < vdr; ++i) {
-        const int vi0 = (v[i] >> 0) & 0x0F0F0F0F;
-        const int vi1 = (v[i] >> 4) & 0x0F0F0F0F;
+        const int vi0 = __vsub4((v[i] >> 0) & 0x0F0F0F0F, 0x08080808);
+        const int vi1 = __vsub4((v[i] >> 4) & 0x0F0F0F0F, 0x08080808);
 
         // SIMD dot product of quantized values
         sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi);
         sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi);
     }
 
-    const float2 ds8f = __half22float2(ds8);
-
-    // second part effectively subtracts 8 from each quant value
-    return d4 * (sumi * ds8f.x - (8*vdr/QI4_0) * ds8f.y);
+    // subtract 8 from the quants, ds8.y is the sum of the unquantized src1 and does not cancel exactly
+    return d4 * (sumi * __low2float(ds8));
 }
 
 #define VDR_Q4_1_Q8_1_MMVQ 2
@@ -184,6 +182,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_0_q8_1_imp
         vi0    |= (vh[i] << 11) & 0x00001000; // 1 -> 12
         vi0    |= (vh[i] << 18) & 0x00100000; // 2 -> 20
         vi0    |= (vh[i] << 25) & 0x10000000; // 3 -> 28
+        vi0     = __vsub4(vi0, 0x10101010);   // subtract 16
         sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi); // SIMD dot product of quantized values
 
         int vi1 = (vl[i] >>  4) & 0x0F0F0F0F; // upper 4 qs bits, still need qh as 5th bits
@@ -191,13 +190,11 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_0_q8_1_imp
         vi1    |= (vh[i] >>  5) & 0x00001000; // 17 -> 12
         vi1    |= (vh[i] <<  2) & 0x00100000; // 18 -> 20
         vi1    |= (vh[i] <<  9) & 0x10000000; // 19 -> 28
+        vi1     = __vsub4(vi1, 0x10101010);   // subtract 16
         sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi); // SIMD dot product of quantized values
     }
 
-    const float2 ds8f = __half22float2(ds8);
-
-    // second part effectively subtracts 16 from each quant value
-    return d5 * (sumi * ds8f.x - (16*vdr/QI5_0) * ds8f.y);
+    return d5 * (sumi * __low2float(ds8));
 }
 
 #define VDR_Q5_1_Q8_1_MMVQ 2

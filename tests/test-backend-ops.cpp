@@ -5136,7 +5136,14 @@ struct test_mul_mat_x_offset : public test_mul_mat {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "b") == 0) {
-                init_tensor_uniform(t, x_offset - 1.0f, x_offset + 1.0f);
+                // the max of every 32 block is the same, so q8_K and q8_1 pick the same scale and quants
+                std::vector<float> data(ggml_nelements(t));
+                std::default_random_engine gen(std::random_device{}());
+                std::uniform_real_distribution<float> distribution(x_offset - 1.0f, x_offset + 1.0f);
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = i % 32 == 0 ? x_offset + 1.0f : distribution(gen);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -10474,6 +10481,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : {1, 8, 16, 512}) {
             test_cases.emplace_back(new test_mul_mat_x_offset(type_a, GGML_TYPE_F32, 256, n, 1024, 4.0f));
         }
+    }
+    // MMQ keeps the sums of these in half precision, which is above the 1e-6 limit for n > 1
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ1_S}) {
+        test_cases.emplace_back(new test_mul_mat_x_offset(type_a, GGML_TYPE_F32, 256, 1, 1024, 4.0f));
     }
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1, 64, 256, {1,  1}, {1, 1}));

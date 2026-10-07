@@ -558,9 +558,19 @@ static __global__ void quantize_mmq_q8_1(
     GGML_UNUSED(n_expert_used);
 }
 
-// Q4_1 and Q5_1 multiply ds.y by the block min, so it must hold d*sum(quants) like the CPU quantizer
+// These types multiply the sums in ds by a block min or offset, so they must hold d*sum(quants) like the CPU
 static bool quantize_q8_1_sum_quants(const ggml_type type_src0) {
-    return type_src0 == GGML_TYPE_Q4_1 || type_src0 == GGML_TYPE_Q5_1;
+    switch (type_src0) {
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_IQ1_S:
+            return true;
+        default:
+            return false;
+    }
 }
 
 void quantize_row_q8_1_cuda(

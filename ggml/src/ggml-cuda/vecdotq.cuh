@@ -1246,6 +1246,7 @@ static __device__ __forceinline__ float vec_dot_iq1_s_q8_1(
     const int qh = bq1->qh[iqs];
 
     int sumi = 0;
+    int sumy = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int grid = iq1s_grid_gpu[qs[l0/2] | (((qh >> 3*(l0/2)) & 0x07) << 8)];
@@ -1258,12 +1259,13 @@ static __device__ __forceinline__ float vec_dot_iq1_s_q8_1(
 
         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+        sumy = ggml_cuda_dp4a(u0, 0x01010101, sumy);
+        sumy = ggml_cuda_dp4a(u1, 0x01010101, sumy);
     }
 
-    const float  d1q   = __half2float(bq1->d) * (((qh >> 11) & 0x0E) + 1);
-    const float  delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
-    const float2 ds    = __half22float2(bq8_1[iqs].ds);
-    return d1q * (ds.x*sumi + ds.y*delta);
+    const float d1q   = __half2float(bq1->d) * (((qh >> 11) & 0x0E) + 1);
+    const float delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
+    return d1q * __low2float(bq8_1[iqs].ds) * (sumi + delta*sumy);
 }
 
 #define VDR_IQ1_M_Q8_1_MMVQ 1

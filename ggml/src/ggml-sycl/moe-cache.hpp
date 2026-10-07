@@ -28,9 +28,10 @@ bool ggml_backend_buffer_is_sycl_moe(ggml_backend_buffer_t buffer);
 // any of its experts are copied to the device.
 typedef void (*ggml_sycl_moe_cache_reorder_t)(ggml_backend_sycl_context * ctx, const ggml_tensor * tensor);
 
-// For a MUL_MAT_ID whose src0 lives in a MoE cache buffer: reads ids on the host, copies the experts the layer
-// is missing into its slot pools and fills src0_view and ids_view (expert ids remapped to slots) so the regular
-// MUL_MAT_ID paths can run on device memory.
+// For a MUL_MAT_ID whose src0 lives in a MoE cache buffer: plans the routing (on the device when the batch can
+// never route to more experts than there are slots, on the host otherwise), copies the experts the layer is
+// missing into its slot pools and fills src0_view and ids_view (expert ids remapped to slots) so the regular
+// MUL_MAT_ID paths can run on device memory. Set GGML_SYCL_MOE_CACHE_DEVICE_PLAN=0 to always plan on the host.
 void ggml_sycl_moe_cache_prepare(ggml_backend_sycl_context & ctx, const ggml_tensor * dst,
                                  ggml_sycl_moe_cache_reorder_t reorder, ggml_tensor & src0_view,
                                  ggml_tensor & ids_view);

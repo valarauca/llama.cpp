@@ -12,13 +12,16 @@
 
 #include "im2col.hpp"
 
+#include <algorithm>
+#include <climits>
+
 #define MAX_GRIDDIM_Z 65535
 
 template <typename T>
 static  void im2col_kernel(
         const float * x, T * dst,
         int64_t IC, int64_t IW, int64_t IH, int64_t OH, int64_t OW, int64_t KW, int64_t KH,
-        int64_t IC_IH_IW, int64_t IH_IW, int64_t N_OH, int64_t KH_KW, int64_t IC_KH_KW,
+        int64_t IC_IH_IW, int64_t IH_IW, int64_t N_OH, int64_t KH_KW, int64_t IC_KH_KW, int64_t ow0,
         int s0, int s1, int p0, int p1, int d0, int d1) {
     auto          item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t i        = item_ct1.get_local_id(2) + item_ct1.get_group(2) * item_ct1.get_local_range(2);
@@ -31,8 +34,8 @@ static  void im2col_kernel(
     const int64_t ikh = rem / KW;
     const int64_t ikw = rem - ikh * KW;
 
-    const int64_t iow = item_ct1.get_group(1);
-    for (int64_t iz = item_ct1.get_group(0); iz < N_OH; iz += MAX_GRIDDIM_Z) {
+    const int64_t iow = ow0 + item_ct1.get_group(1);
+    for (int64_t iz = item_ct1.get_group(0); iz < N_OH; iz += item_ct1.get_group_range(0)) {
         const int64_t  in = iz / OH;
         const int64_t  ioh = iz - in * OH;
 
@@ -52,6 +55,19 @@ static  void im2col_kernel(
 
     GGML_UNUSED(IC);
     GGML_UNUSED(KH);
+}
+
+// Splits a launch of rows x cols work-items per (N*OH)-row so that each launch's global range
+// stays within INT_MAX, which the SYCL runtime requires unless device code is built with
+// -fsycl-id-queries-range=size_t. Work-groups stride over the rows the grid does not cover.
+template <typename F>
+static void im2col_launch_chunked(int64_t row_items, int64_t OW, int64_t n_rows, F && launch) {
+    const int64_t ow_chunk = std::max<int64_t>(1, std::min<int64_t>(OW, INT_MAX / row_items));
+    for (int64_t ow0 = 0; ow0 < OW; ow0 += ow_chunk) {
+        const int64_t ow_n = std::min(ow_chunk, OW - ow0);
+        const int64_t nz   = std::max<int64_t>(1, std::min<int64_t>({ n_rows, MAX_GRIDDIM_Z, INT_MAX / (ow_n * row_items) }));
+        launch(ow0, ow_n, nz);
+    }
 }
 
 // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
@@ -79,16 +95,15 @@ static void im2col_sycl(const float *   x,
     const int64_t num_blocks = (IC_KH_KW + SYCL_IM2COL_BLOCK_SIZE - 1) / SYCL_IM2COL_BLOCK_SIZE;
     const int64_t N_OH = N * OH;
     const int64_t KH_KW = KW*KH;
-    dpct::dim3    block_nums(num_blocks, OW, MIN(N_OH, MAX_GRIDDIM_Z));
-    /*
-    DPCT1049:73: The work-group size passed to the SYCL kernel may exceed the limit. To get the device limit, query info::device::max_work_group_size. Adjust the work-group size if needed.
-    */
-    stream->parallel_for(sycl::nd_range<3>(block_nums * sycl::range<3>(1, 1, MIN(IC_KH_KW, SYCL_IM2COL_BLOCK_SIZE)),
-                                           sycl::range<3>(1, 1, MIN(IC_KH_KW, SYCL_IM2COL_BLOCK_SIZE))),
-                         [=](sycl::nd_item<3>) {
-                             im2col_kernel(x, dst, IC, IW, IH, OH, OW, KW, KH, IC_IH_IW, IH_IW, N_OH, KH_KW, IC_KH_KW,
-                                           s0, s1, p0, p1, d0, d1);
-                         });
+    const int64_t wg    = MIN(IC_KH_KW, SYCL_IM2COL_BLOCK_SIZE);
+    im2col_launch_chunked(num_blocks * wg, OW, N_OH, [&](int64_t ow0, int64_t ow_n, int64_t nz) {
+        dpct::dim3 block_nums(num_blocks, ow_n, nz);
+        stream->parallel_for(sycl::nd_range<3>(block_nums * sycl::range<3>(1, 1, wg), sycl::range<3>(1, 1, wg)),
+                             [=](sycl::nd_item<3>) {
+                                 im2col_kernel(x, dst, IC, IW, IH, OH, OW, KW, KH, IC_IH_IW, IH_IW, N_OH, KH_KW,
+                                               IC_KH_KW, ow0, s0, s1, p0, p1, d0, d1);
+                             });
+    });
 }
 
 static void im2col_sycl_f16(const float *   x,
@@ -185,7 +200,7 @@ static  void im2col_3d_kernel(
         int64_t OH_OW, int64_t KD_KH_KW, int64_t ID_IH_IW, int64_t KH_KW, int64_t IH_IW, int64_t IC_ID_IH_IW,
         int64_t IC_KD_KH_KW, int64_t OW_KD_KH_KW, int64_t OD_OH_OW_IC_KD_KH_KW, int64_t OH_OW_IC_KD_KH_KW,
         int64_t OW_IC_KD_KH_KW, int64_t N_OD_OH, int64_t OD_OH,
-        int64_t stride_q, int64_t stride_z, int64_t stride_y, int64_t stride_x,
+        int64_t stride_q, int64_t stride_z, int64_t stride_y, int64_t stride_x, int64_t ow0,
         int s0, int s1, int s2, int p0, int p1, int p2, int d0, int d1, int d2) {
     auto          item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t i        = item_ct1.get_local_id(2) + item_ct1.get_group(2) * item_ct1.get_local_range(2);
@@ -200,8 +215,8 @@ static  void im2col_3d_kernel(
     const int64_t ikh = (i - iic * KD_KH_KW - ikd * KH_KW) / KW;
     const int64_t ikw = i % KW;
 
-    const int64_t iow = item_ct1.get_group(1);
-    for (int64_t iz = item_ct1.get_group(0); iz < N_OD_OH; iz += MAX_GRIDDIM_Z) {
+    const int64_t iow = ow0 + item_ct1.get_group(1);
+    for (int64_t iz = item_ct1.get_group(0); iz < N_OD_OH; iz += item_ct1.get_group_range(0)) {
         const int64_t in  = iz / OD_OH;
         const int64_t iod = (iz - in*OD_OH) / OH;
         const int64_t ioh = iz % OH;
@@ -265,19 +280,18 @@ static void im2col_3d_sycl(const float *   src,
     const int64_t OH_OW_IC_KD_KH_KW = OH*OW*IC*KD*KH*KW;
     const int64_t OW_IC_KD_KH_KW = OW*IC*KD*KH*KW;
     const int64_t num_blocks = (IC_KD_KH_KW + SYCL_IM2COL_BLOCK_SIZE - 1) / SYCL_IM2COL_BLOCK_SIZE;
-    dpct::dim3    block_nums(num_blocks, OW, MIN(N_OD_OH, MAX_GRIDDIM_Z));
-    /*
-    DPCT1049:74: The work-group size passed to the SYCL kernel may exceed the limit. To get the device limit, query info::device::max_work_group_size. Adjust the work-group size if needed.
-    */
-    stream->parallel_for(sycl::nd_range<3>(block_nums * sycl::range<3>(1, 1, MIN(IC_KD_KH_KW, SYCL_IM2COL_BLOCK_SIZE)),
-                                           sycl::range<3>(1, 1, MIN(IC_KD_KH_KW, SYCL_IM2COL_BLOCK_SIZE))),
-                         [=](sycl::nd_item<3>) {
-                             im2col_3d_kernel(src, dst, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW, OH_OW, KD_KH_KW,
-                                              ID_IH_IW, KH_KW, IH_IW, IC_ID_IH_IW, IC_KD_KH_KW, OW_KD_KH_KW,
-                                              OD_OH_OW_IC_KD_KH_KW, OH_OW_IC_KD_KH_KW, OW_IC_KD_KH_KW, N_OD_OH, OD_OH,
-                                              stride_q, stride_z, stride_y, stride_x, s0, s1, s2, p0, p1, p2, d0, d1,
-                                              d2);
-                         });
+    const int64_t wg         = MIN(IC_KD_KH_KW, SYCL_IM2COL_BLOCK_SIZE);
+    im2col_launch_chunked(num_blocks * wg, OW, N_OD_OH, [&](int64_t ow0, int64_t ow_n, int64_t nz) {
+        dpct::dim3 block_nums(num_blocks, ow_n, nz);
+        stream->parallel_for(sycl::nd_range<3>(block_nums * sycl::range<3>(1, 1, wg), sycl::range<3>(1, 1, wg)),
+                             [=](sycl::nd_item<3>) {
+                                 im2col_3d_kernel(src, dst, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW, OH_OW,
+                                                  KD_KH_KW, ID_IH_IW, KH_KW, IH_IW, IC_ID_IH_IW, IC_KD_KH_KW,
+                                                  OW_KD_KH_KW, OD_OH_OW_IC_KD_KH_KW, OH_OW_IC_KD_KH_KW, OW_IC_KD_KH_KW,
+                                                  N_OD_OH, OD_OH, stride_q, stride_z, stride_y, stride_x, ow0, s0, s1,
+                                                  s2, p0, p1, p2, d0, d1, d2);
+                             });
+    });
 }
 
 static void im2col_3d_sycl_f16(const float *   src,

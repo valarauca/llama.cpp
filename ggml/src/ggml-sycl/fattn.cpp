@@ -98,7 +98,7 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_XMX      = 120, // joint_matrix (DPAS) kernel, opt-in via GGML_SYCL_FA_XMX
+    BEST_FATTN_KERNEL_XMX      = 120, // joint_matrix (DPAS) kernel, default for prefill, GGML_SYCL_FA_XMX=0 disables
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_MKL      = 300,

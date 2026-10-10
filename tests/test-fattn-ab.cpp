@@ -4,7 +4,9 @@
 // through SYCL0 once per kernel, forcing each with GGML_SYCL_FA_KERNEL. Reports the kernel that
 // actually ran, the error against the CPU result, and the time per call.
 //
-// usage: test-fattn-ab [shape-name-filter]
+// usage: test-fattn-ab [--gpu-only] [shape-name-filter]
+//
+// --gpu-only skips the CPU reference, for profiling the SYCL kernels.
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -167,7 +169,15 @@ static void compare(const std::vector<float> & a, const std::vector<float> & ref
 }
 
 int main(int argc, char ** argv) {
-    const char * filter = argc > 1 ? argv[1] : nullptr;
+    const char * filter   = nullptr;
+    bool         gpu_only = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--gpu-only") == 0) {
+            gpu_only = true;
+        } else {
+            filter = argv[i];
+        }
+    }
 
     set_env("GGML_SYCL_MKL_FA_DEBUG", "1");
     ggml_log_set(capture_dispatch_log, nullptr);
@@ -179,7 +189,7 @@ int main(int argc, char ** argv) {
     }
     ggml_backend_t sycl = ggml_backend_dev_init(sycl_dev, nullptr);
     ggml_backend_t cpu  = ggml_backend_cpu_init();
-    ggml_backend_cpu_set_n_threads(cpu, (int) std::max(1u, std::thread::hardware_concurrency()));
+    ggml_backend_cpu_set_n_threads(cpu, (int) std::clamp(std::thread::hardware_concurrency(), 1u, 8u));
 
     const fa_shape shapes[] = {
         { "dit-4096x4096-h24",        128, 4096, 4096, 24, 24, false, true,  128 },
@@ -191,6 +201,11 @@ int main(int argc, char ** argv) {
         { "d64-unmasked-1024x1024",    64, 1024, 1024, 16, 16, false, true,   64 },
         { "d256-gqa-causal-512x1024", 256,  512, 1024, 16,  8, true,  false, 256 },
         { "mla-576-512-causal-512x1024", 576, 512, 1024, 16, 1, true, false, 512 },
+        { "d256-h24-causal-512x512",   256,  512,   512, 24,  4, true,  false, 256 },
+        { "d256-h24-causal-512x4608",  256,  512,  4608, 24,  4, true,  false, 256 },
+        { "d256-h24-causal-512x8704",  256,  512,  8704, 24,  4, true,  false, 256 },
+        { "d256-h24-causal-512x16896", 256,  512, 16896, 24,  4, true,  false, 256 },
+        { "d256-h24-causal-512x33280", 256,  512, 33280, 24,  4, true,  false, 256 },
     };
     const char * kernels[] = { "tile", "onednn", "xmx" };
     const double nmse_max  = 5e-4;
@@ -204,10 +219,13 @@ int main(int argc, char ** argv) {
         }
         const fa_inputs in = make_inputs(s);
 
-        fa_graph ref_g;
-        build(ref_g, s, in, cpu);
-        ggml_backend_graph_compute(cpu, ref_g.gf);
-        const std::vector<float> ref = read_out(ref_g);
+        std::vector<float> ref;
+        if (!gpu_only) {
+            fa_graph ref_g;
+            build(ref_g, s, in, cpu);
+            ggml_backend_graph_compute(cpu, ref_g.gf);
+            ref = read_out(ref_g);
+        }
 
         const double flops = 2.0 * (double) s.H * s.nq * s.nkv * (s.D + s.Dv);
         for (const char * kernel : kernels) {
@@ -228,9 +246,11 @@ int main(int argc, char ** argv) {
             const auto   t1 = std::chrono::high_resolution_clock::now();
             const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
 
-            double nmse, maxabs;
-            compare(read_out(g), ref, nmse, maxabs);
-            const bool bad = !(nmse <= nmse_max);
+            double nmse = NAN, maxabs = NAN;
+            if (!gpu_only) {
+                compare(read_out(g), ref, nmse, maxabs);
+            }
+            const bool bad = !gpu_only && !(nmse <= nmse_max);
             failures += bad;
             printf("%-26s %-7s %-7s %11.3e %11.3e %10.3f %8.1f%s\n", s.name, kernel, ran.c_str(), nmse, maxabs, ms,
                    flops / ms / 1e9, bad ? "  FAIL" : "");

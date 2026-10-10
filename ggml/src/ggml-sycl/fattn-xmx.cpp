@@ -8,6 +8,7 @@
 #ifdef GGML_SYCL_FA_XMX
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/ext/oneapi/experimental/prefetch.hpp>
 
 namespace jm     = sycl::ext::oneapi::experimental::matrix;
 namespace jmi    = sycl::ext::intel::experimental::matrix;
@@ -18,7 +19,9 @@ static constexpr int XMX_SG  = 16;
 static constexpr int XMX_TM  = 8;
 static constexpr int XMX_TN  = 16;
 static constexpr int XMX_TK  = 16;
-static constexpr int XMX_NSG = 4;
+static constexpr int XMX_NSG = 8;
+// 2D block prefetch tiles are at most 64 bytes wide.
+static constexpr int XMX_PC  = 32;
 
 struct fattn_xmx_params {
     const sycl::half * Q;
@@ -42,10 +45,14 @@ static auto fattn_xmx_global(const T * p) {
 // keys with an online softmax. Per-row state is indexed by accumulator element, which relies on
 // element i of an 8x16 accumulator (and of the 8x16 A operand) holding row i, column lane;
 // fattn_xmx_layout_ok() checks that on the device before the kernel is first used.
+// While a block is processed, each sub-group prefetches its slice of the next K/V block into L1.
+// Staging K/V through SLM was measured slower on Xe2: the 2D block loads already share the
+// tiles across sub-groups through L1, and SLM adds a copy and two barriers per block.
 template <int D, int BC>
 struct fattn_xmx_kernel {
     static constexpr int DT = D / XMX_TK;
     static constexpr int CT = BC / XMX_TN;
+    static constexpr int PR = BC / XMX_NSG;
 
     fattn_xmx_params p;
 
@@ -98,6 +105,16 @@ struct fattn_xmx_kernel {
         }
 
         for (int kb = 0; kb < p.nkv; kb += BC) {
+            if (kb + 2 * BC <= p.nkv) {
+                const int64_t r = kb + BC + sgid * PR;
+#pragma unroll
+                for (int cc = 0; cc < D; cc += XMX_PC) {
+                    jm::joint_matrix_prefetch<PR, XMX_PC>(sg, const_cast<half *>(Kh) + r * p.k_s1 + cc, p.k_s1,
+                                                          jm::layout::row_major, syclex::properties{ syclex::prefetch_hint_L1 });
+                    jm::joint_matrix_prefetch<PR, XMX_PC>(sg, const_cast<half *>(Vh) + r * p.v_s1 + cc, p.v_s1,
+                                                          jm::layout::row_major, syclex::properties{ syclex::prefetch_hint_L1 });
+                }
+            }
             jm::joint_matrix<sub_group, float, jm::use::accumulator, XMX_TM, XMX_TN> s[CT];
 #pragma unroll
             for (int c = 0; c < CT; ++c) {

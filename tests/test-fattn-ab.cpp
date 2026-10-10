@@ -4,9 +4,10 @@
 // through SYCL0 once per kernel, forcing each with GGML_SYCL_FA_KERNEL. Reports the kernel that
 // actually ran, the error against the CPU result, and the time per call.
 //
-// usage: test-fattn-ab [--gpu-only] [shape-name-filter]
+// usage: test-fattn-ab [--gpu-only] [--kernel tile|onednn|xmx]... [shape-name-filter]
 //
-// --gpu-only skips the CPU reference, for profiling the SYCL kernels.
+// --gpu-only skips the CPU reference, for profiling the SYCL kernels. --kernel limits the run to
+// the named kernels (all three by default).
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -169,11 +170,14 @@ static void compare(const std::vector<float> & a, const std::vector<float> & ref
 }
 
 int main(int argc, char ** argv) {
-    const char * filter   = nullptr;
-    bool         gpu_only = false;
+    const char *              filter   = nullptr;
+    bool                      gpu_only = false;
+    std::vector<const char *> only;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--gpu-only") == 0) {
             gpu_only = true;
+        } else if (strcmp(argv[i], "--kernel") == 0 && i + 1 < argc) {
+            only.push_back(argv[++i]);
         } else {
             filter = argv[i];
         }
@@ -206,6 +210,8 @@ int main(int argc, char ** argv) {
         { "d256-h24-causal-512x8704",  256,  512,  8704, 24,  4, true,  false, 256 },
         { "d256-h24-causal-512x16896", 256,  512, 16896, 24,  4, true,  false, 256 },
         { "d256-h24-causal-512x33280", 256,  512, 33280, 24,  4, true,  false, 256 },
+        { "d256-h16-causal-512x4608",  256,  512,  4608, 16,  4, true,  false, 256 },
+        { "d256-h16-causal-512x33280", 256,  512, 33280, 16,  4, true,  false, 256 },
     };
     const char * kernels[] = { "tile", "onednn", "xmx" };
     const double nmse_max  = 5e-4;
@@ -229,6 +235,9 @@ int main(int argc, char ** argv) {
 
         const double flops = 2.0 * (double) s.H * s.nq * s.nkv * (s.D + s.Dv);
         for (const char * kernel : kernels) {
+            if (!only.empty() && std::none_of(only.begin(), only.end(), [&](const char * k) { return strcmp(k, kernel) == 0; })) {
+                continue;
+            }
             set_env("GGML_SYCL_FA_KERNEL", kernel);
             fa_graph g;
             build(g, s, in, sycl);

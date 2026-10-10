@@ -29,6 +29,13 @@ static constexpr int64_t XMX_KV_END_MIN = (int64_t) 1 << 29;
 static constexpr int XMX_MLA_DK  = 576;
 static constexpr int XMX_MLA_DV  = 512;
 static constexpr int XMX_MLA_NSG = 4;
+// Split-KV (head_dim 256 only): KV length below which a row block is never split (each split
+// then gets at least half of it), and the most work-groups one row block is split across.
+static constexpr int XMX_SPLIT_MIN_KV = 2048;
+static constexpr int XMX_SPLIT_MAX    = 4;
+// head_dim 256: heads of one KV head per work-group (each with 8 sub-groups of 8 rows), so that a
+// work-group fills an Xe core and its sub-groups share K/V tiles and mask rows through L1.
+static constexpr int XMX_D256_HPW     = 4;
 
 struct fattn_xmx_params {
     const sycl::half * Q;
@@ -44,11 +51,35 @@ struct fattn_xmx_params {
     int64_t            mask_s1;
     int                nq, nkv, H, Hkv, mb;
     float              scale;
+    float *            part;
+    sycl::float2 *     part_ml;
+    int                nsplit, rb0, nrb;
+    const int *        kv_zero;
 };
 
 template <typename T>
 static auto fattn_xmx_global(const T * p) {
     return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(const_cast<T *>(p));
+}
+
+// Row block n of a packed launch as (batch, head, query block). Each run of four row blocks takes
+// four heads of one KV head at the same query block where the GQA ratio allows, and the heads left
+// over in each KV group at adjacent query blocks (27B, 6 heads per KV head: heads 0-3 at one
+// block, then heads 4-5 at two).
+static inline void fattn_xmx_unit(int n, int nqb, int H, int R, int & b, int & h, int & qb) {
+    b = n / (nqb * H);
+    n %= nqb * H;
+    const int kvh  = n / (nqb * R);
+    const int full = R / 4 * 4 * nqb;
+    n %= nqb * R;
+    if (n < full) {
+        h  = kvh * R + n / (4 * nqb) * 4 + n % 4;
+        qb = n / 4 % nqb;
+    } else {
+        n -= full;
+        h  = kvh * R + R / 4 * 4 + n % (R % 4);
+        qb = n / (R % 4);
+    }
 }
 
 // One sub-group owns TM query rows of one head and streams the KV sequence in blocks of BC keys
@@ -71,15 +102,28 @@ static auto fattn_xmx_global(const T * p) {
 // across sub-groups through L1, and SLM adds a copy and two barriers per block. Two 8-row tiles
 // per sub-group were measured 3-4x slower than one, and a native 16-row tile only fits (and only
 // wins) at head_dim 64.
-template <int DK, int DV, int TM, int BC, bool QREG, bool QF32>
+//
+// With NSG = HPW * 8 a work-group runs HPW row blocks of 64 rows, picked by fattn_xmx_unit() to
+// share one KV head. At head_dim 256 that is 32 sub-groups, a whole Xe core, so the K/V tiles and
+// mask rows those row blocks have in common are shared through L1 whatever the dispatcher does.
+// Head_dim 256 also skips the mask in full blocks inside the all-zero prefix kv_zero gives.
+//
+// SPLIT runs row blocks rb0 .. rb0 + nrb - 1 with the KV range of each shared out over nsplit
+// work-groups. Each writes its unnormalized output and per-row max and sum to part / part_ml, and
+// fattn_xmx_combine() merges them into dst.
+template <int DK, int DV, int TM, int BC, bool QREG, bool QF32, bool SPLIT = false, int NSG = XMX_NSG>
 struct fattn_xmx_kernel {
     static constexpr int DKT = DK / XMX_TK;
     static constexpr int DVT = DV / XMX_TN;
     static constexpr int CT  = BC / XMX_TN;
-    static constexpr int PR  = BC / XMX_NSG;
+    static constexpr int PR  = BC / NSG;
+    static constexpr int LB  = 2;
+    static constexpr int HPW = NSG / XMX_NSG;
 
     using a_t = jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, TM, XMX_TK, jm::layout::row_major>;
     using c_t = jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, TM, XMX_TN>;
+    using k_t = jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, XMX_TK, XMX_TN, jm::layout::col_major>;
+    using v_t = jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, XMX_TK, XMX_TN, jm::layout::row_major>;
 
     fattn_xmx_params p;
 
@@ -105,16 +149,30 @@ struct fattn_xmx_kernel {
         const int lane = sg.get_local_linear_id();
 
         const int nqb = (p.nq + TM * XMX_NSG - 1) / (TM * XMX_NSG);
-        const int g   = it.get_group(0);
-        const int qb  = g % nqb;
-        const int h   = (g / nqb) % p.H;
-        const int b   = g / (nqb * p.H);
-        const int q0  = (qb * XMX_NSG + sgid) * TM;
+        const int gu  = it.get_group(0);
+        const int g   = (SPLIT ? p.rb0 / HPW + gu % (p.nrb / HPW) : gu) * HPW + sgid / XMX_NSG;
+        int       qb  = g % nqb;
+        int       h   = (g / nqb) % p.H;
+        int       b   = g / (nqb * p.H);
+        if constexpr (HPW > 1) {
+            fattn_xmx_unit(g, nqb, p.H, p.H / p.Hkv, b, h, qb);
+        }
+        const int q0  = (qb * XMX_NSG + sgid % XMX_NSG) * TM;
         if (q0 >= p.nq) {
             return;
         }
         const int hk     = h / (p.H / p.Hkv);
-        const int kv_end = p.kv_end ? p.kv_end[q0 / TM] : p.nkv;
+        const int kv_len  = p.kv_end ? p.kv_end[q0 / TM] : p.nkv;
+        const int kv_zero = DK == 256 && p.kv_zero ? p.kv_zero[q0 / TM] : 0;
+        int       kv_lo   = 0;
+        int       kv_end  = kv_len;
+        int       sp      = 0;
+        if constexpr (SPLIT) {
+            const int chunk = ((kv_len + p.nsplit - 1) / p.nsplit + BC - 1) / BC * BC;
+            sp              = gu / (p.nrb / HPW);
+            kv_lo           = sp * chunk;
+            kv_end          = sycl::min(kv_len, kv_lo + chunk);
+        }
 
         const half *  Qh  = QF32 ? nullptr : p.Q + ((size_t) b * p.H + h) * p.nq * DK;
         const float * Qfh = QF32 ? p.Qf + b * p.q_s3 + h * p.q_s2 : nullptr;
@@ -146,7 +204,7 @@ struct fattn_xmx_kernel {
             l[i] = 0.0f;
         }
 
-        for (int kb = 0; kb < kv_end; kb += BC) {
+        for (int kb = kv_lo; kb < kv_end; kb += BC) {
             if (kb + 2 * BC <= kv_end) {
                 const int64_t r = kb + BC + sgid * PR;
 #pragma unroll
@@ -162,19 +220,41 @@ struct fattn_xmx_kernel {
             }
 
             c_t s[CT];
+            if constexpr (QREG) {
 #pragma unroll
-            for (int c = 0; c < CT; ++c) {
-                jm::joint_matrix_fill(sg, s[c], 0.0f);
+                for (int c = 0; c < CT; ++c) {
+                    jm::joint_matrix_fill(sg, s[c], 0.0f);
 #pragma unroll
-                for (int t = 0; t < DKT; ++t) {
-                    jm::joint_matrix<sub_group, half, jm::use::b, XMX_TK, XMX_TN, jm::layout::col_major> kt;
-                    jmi::joint_matrix_load_checked(sg, kt, fattn_xmx_global(Kh), p.k_s1, p.nkv, DK, kb + c * XMX_TN, t * XMX_TK);
-                    if constexpr (QREG) {
+                    for (int t = 0; t < DKT; ++t) {
+                        k_t kt;
+                        jmi::joint_matrix_load_checked(sg, kt, fattn_xmx_global(Kh), p.k_s1, p.nkv, DK, kb + c * XMX_TN, t * XMX_TK);
                         jm::joint_matrix_mad(sg, s[c], qa[t], kt, s[c]);
-                    } else {
-                        a_t qt;
-                        load_q(sg, qt, Qh, Qfh, q0, t);
-                        jm::joint_matrix_mad(sg, s[c], qt, kt, s[c]);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int c = 0; c < CT; ++c) {
+                    jm::joint_matrix_fill(sg, s[c], 0.0f);
+                }
+#pragma unroll
+                for (int t = 0; t < DKT; t += LB) {
+                    a_t qt[LB];
+                    k_t kt[LB][CT];
+#pragma unroll
+                    for (int j = 0; j < LB; ++j) {
+                        load_q(sg, qt[j], Qh, Qfh, q0, t + j);
+#pragma unroll
+                        for (int c = 0; c < CT; ++c) {
+                            jmi::joint_matrix_load_checked(sg, kt[j][c], fattn_xmx_global(Kh), p.k_s1, p.nkv, DK, kb + c * XMX_TN,
+                                                           (t + j) * XMX_TK);
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < LB; ++j) {
+#pragma unroll
+                        for (int c = 0; c < CT; ++c) {
+                            jm::joint_matrix_mad(sg, s[c], qt[j], kt[j][c], s[c]);
+                        }
                     }
                 }
             }
@@ -186,7 +266,7 @@ struct fattn_xmx_kernel {
             }
             const bool full_block = kb + BC <= p.nkv;
             bool       scaled     = false;
-            if (TM == 8 && full_block && !p.mask) {
+            if (TM == 8 && full_block && (!p.mask || (DK == 256 && kb + BC <= kv_zero))) {
 #pragma unroll
                 for (int c = 0; c < CT; ++c) {
                     int i = 0;
@@ -256,20 +336,65 @@ struct fattn_xmx_kernel {
                 jm::joint_matrix_copy(sg, s[c], pa[c]);
             }
 
+            if constexpr (QREG) {
 #pragma unroll
-            for (int t = 0; t < DVT; ++t) {
-                int i = 0;
-                jm::joint_matrix_apply(sg, o[t], [&](float & x) {
-                    x *= alpha[i];
-                    ++i;
-                });
+                for (int t = 0; t < DVT; ++t) {
+                    int i = 0;
+                    jm::joint_matrix_apply(sg, o[t], [&](float & x) {
+                        x *= alpha[i];
+                        ++i;
+                    });
 #pragma unroll
-                for (int c = 0; c < CT; ++c) {
-                    jm::joint_matrix<sub_group, half, jm::use::b, XMX_TK, XMX_TN, jm::layout::row_major> vb;
-                    jmi::joint_matrix_load_checked(sg, vb, fattn_xmx_global(Vh), p.v_s1, p.nkv, DV, kb + c * XMX_TK, t * XMX_TN);
-                    jm::joint_matrix_mad(sg, o[t], pa[c], vb, o[t]);
+                    for (int c = 0; c < CT; ++c) {
+                        v_t vb;
+                        jmi::joint_matrix_load_checked(sg, vb, fattn_xmx_global(Vh), p.v_s1, p.nkv, DV, kb + c * XMX_TK, t * XMX_TN);
+                        jm::joint_matrix_mad(sg, o[t], pa[c], vb, o[t]);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int t = 0; t < DVT; t += LB) {
+                    v_t vb[LB][CT];
+#pragma unroll
+                    for (int j = 0; j < LB; ++j) {
+#pragma unroll
+                        for (int c = 0; c < CT; ++c) {
+                            jmi::joint_matrix_load_checked(sg, vb[j][c], fattn_xmx_global(Vh), p.v_s1, p.nkv, DV, kb + c * XMX_TK,
+                                                           (t + j) * XMX_TN);
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < LB; ++j) {
+                        int i = 0;
+                        jm::joint_matrix_apply(sg, o[t + j], [&](float & x) {
+                            x *= alpha[i];
+                            ++i;
+                        });
+#pragma unroll
+                        for (int c = 0; c < CT; ++c) {
+                            jm::joint_matrix_mad(sg, o[t + j], pa[c], vb[j][c], o[t + j]);
+                        }
+                    }
                 }
             }
+        }
+
+        if constexpr (SPLIT) {
+            float * ph = p.part + ((size_t) (sp * p.mb + b) * p.nq * p.H + h) * DV;
+#pragma unroll
+            for (int t = 0; t < DVT; ++t) {
+                jmi::joint_matrix_store_checked(sg, o[t], fattn_xmx_global(ph), (size_t) p.H * DV, jm::layout::row_major,
+                                                p.nq, DV, q0, t * XMX_TN);
+            }
+            sycl::float2 * mlh = p.part_ml + ((size_t) (sp * p.mb + b) * p.H + h) * p.nq + q0;
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                const float ls = reduce_over_group(sg, l[i], plus<float>());
+                if (lane == 0 && q0 + i < p.nq) {
+                    mlh[i] = sycl::float2(m[i], ls);
+                }
+            }
+            return;
         }
 
         float inv[TM];
@@ -293,12 +418,86 @@ struct fattn_xmx_kernel {
     }
 };
 
-template <int DK, int DV, int TM, int BC, bool QREG, bool QF32>
-static void fattn_xmx_launch(dpct::queue_ptr stream, const fattn_xmx_params & p) {
-    const int    nqb    = (p.nq + TM * XMX_NSG - 1) / (TM * XMX_NSG);
-    const size_t groups = (size_t) nqb * p.H * p.mb;
-    stream->parallel_for(sycl::nd_range<1>(groups * XMX_NSG * XMX_SG, XMX_NSG * XMX_SG),
-                         fattn_xmx_kernel<DK, DV, TM, BC, QREG, QF32>{ p });
+template <int DK, int DV, int TM, int BC, bool QREG, bool QF32, bool SPLIT = false, int NSG = XMX_NSG>
+static void fattn_xmx_launch(dpct::queue_ptr stream, const fattn_xmx_params & p, size_t groups = 0) {
+    constexpr int HPW = NSG / XMX_NSG;
+    const int     nqb = (p.nq + TM * XMX_NSG - 1) / (TM * XMX_NSG);
+    if (groups == 0) {
+        groups = SPLIT ? (size_t) p.nrb / HPW * p.nsplit : (size_t) nqb * p.H * p.mb / HPW;
+    }
+    stream->parallel_for(sycl::nd_range<1>(groups * NSG * XMX_SG, NSG * XMX_SG),
+                         fattn_xmx_kernel<DK, DV, TM, BC, QREG, QF32, SPLIT, NSG>{ p });
+}
+
+// Merges the nsplit partial outputs of a split-KV launch over row blocks rb0 .. rb0 + nrb - 1 into
+// dst, weighting each by its row sum and the exp2 distance of its row max from the largest.
+static void fattn_xmx_combine(const fattn_xmx_params & p, int64_t DV, bool packed, dpct::queue_ptr stream) {
+    const float *        part   = p.part;
+    const sycl::float2 * ml     = p.part_ml;
+    float *              dst    = p.dst;
+    const int            nsplit = p.nsplit;
+    const int64_t        nq     = p.nq;
+    const int64_t        H      = p.H;
+    const int64_t        mb     = p.mb;
+    const int64_t        rb0    = p.rb0;
+    const int64_t        rows   = 8 * XMX_NSG;
+    const int64_t        nqb    = (nq + rows - 1) / rows;
+    const int64_t        ss     = mb * nq * H * DV;
+    const int            R      = p.H / p.Hkv;
+    stream->parallel_for(sycl::range<1>((size_t) p.nrb * rows * DV / 4), [=](sycl::id<1> id) {
+        const int64_t d  = (int64_t) id[0] * 4 % DV;
+        const int64_t r  = (int64_t) id[0] * 4 / DV;
+        const int     n  = (int) (rb0 + r / rows);
+        int           qb = n % nqb;
+        int           h  = n / nqb % H;
+        int           b  = n / (nqb * H);
+        if (packed) {
+            fattn_xmx_unit(n, (int) nqb, (int) H, R, b, h, qb);
+        }
+        const int64_t q = (int64_t) qb * rows + r % rows;
+        if (q >= nq) {
+            return;
+        }
+        const int64_t e  = ((b * nq + q) * H + h) * DV + d;
+        float         mx = -INFINITY;
+        for (int s = 0; s < nsplit; ++s) {
+            mx = sycl::fmax(mx, ml[((s * mb + b) * H + h) * nq + q].x());
+        }
+        sycl::float4 acc(0.0f);
+        float        ls = 0.0f;
+        for (int s = 0; s < nsplit; ++s) {
+            const sycl::float2 v = ml[((s * mb + b) * H + h) * nq + q];
+            const float        w = v.x() == -INFINITY ? 0.0f : sycl::exp2(v.x() - mx);
+            ls += w * v.y();
+            acc += w * *(const sycl::float4 *) (part + s * ss + e);
+        }
+        *(sycl::float4 *) (dst + e) = ls > 0.0f ? acc / ls : sycl::float4(0.0f);
+    });
+}
+
+// Work-groups left over past the last full wave would run in a half-empty wave as long as a full
+// one (27B prefill: 24 heads, nq 512, 48 packed work-groups against 32 Xe cores). The full waves
+// run as one launch and the leftover work-groups as a second one, with each KV range split over as
+// many work-groups as fill a single wave. Work-groups that start together read K/V in step, which
+// L3 rewards, so splitting every row block over more waves was measured slower.
+struct fattn_xmx_plan {
+    int64_t full;
+    int64_t tail;
+    int     nsplit;
+};
+
+static fattn_xmx_plan fattn_xmx_plan_split(int device, int nsg, int64_t groups, int64_t nkv) {
+    const int64_t resident = (int64_t) ggml_sycl_info().devices[device].nsm * 16 * 4 / nsg;
+    const int64_t full     = groups / resident * resident;
+    const int64_t tail     = groups - full;
+    int           nsplit   = tail > 0 ? (int) std::min<int64_t>(XMX_SPLIT_MAX, resident / tail) : 1;
+    while (nsplit > 1 && nkv / nsplit < XMX_SPLIT_MIN_KV / 2) {
+        --nsplit;
+    }
+    if (nkv < XMX_SPLIT_MIN_KV || nsplit < 2) {
+        return { groups, 0, 1 };
+    }
+    return { full, tail, nsplit };
 }
 
 // MLA (K head_dim 576, V head_dim 512) does not fit one sub-group: the 512-wide output alone
@@ -552,6 +751,54 @@ static void fattn_xmx_kv_end(const sycl::half * mask, int * out, int nq, int nkv
         }
         if (lane == 0) {
             out[it.get_group(0)] = end;
+        }
+    });
+}
+
+// For each block of `rows` query rows: the KV bound fattn_xmx_kv_end() gives, and the length of the
+// key prefix whose mask is exactly 0 in every row, which the head_dim 256 kernel runs without
+// reading the mask. One work-group per block reads its mask rows once.
+static void fattn_xmx_kv_bounds(const sycl::half * mask, int * end, int * zero, int nq, int nkv, int rows,
+                                int64_t mask_s1, dpct::queue_ptr stream) {
+    constexpr int WG   = 1024;
+    const int     nblk = (nq + rows - 1) / rows;
+    const int     nv   = (uintptr_t) mask % 16 == 0 && mask_s1 % 8 == 0 ? nkv / 8 : 0;
+    stream->parallel_for(sycl::nd_range<1>((size_t) nblk * WG, WG), [=](sycl::nd_item<1> it) {
+        const int r0    = it.get_group(0) * rows;
+        const int nr    = sycl::min(rows, nq - r0);
+        const int li    = it.get_local_linear_id();
+        int       last  = 0;
+        int       first = nkv;
+        for (int k8 = li; k8 < nv; k8 += WG) {
+            for (int r = 0; r < nr; ++r) {
+                const sycl::uint4 v = *(const sycl::uint4 *) (mask + (int64_t) (r0 + r) * mask_s1 + k8 * 8);
+                for (int e = 0; e < 8; ++e) {
+                    const uint32_t x = (v[e / 2] >> (e % 2 * 16)) & 0xFFFF;
+                    if (x != 0xFC00) {
+                        last = sycl::max(last, k8 * 8 + e + 1);
+                    }
+                    if ((x & 0x7FFF) != 0) {
+                        first = sycl::min(first, k8 * 8 + e);
+                    }
+                }
+            }
+        }
+        for (int k = nv * 8 + li; k < nkv; k += WG) {
+            for (int r = 0; r < nr; ++r) {
+                const uint16_t x = sycl::bit_cast<uint16_t>(mask[(int64_t) (r0 + r) * mask_s1 + k]);
+                if (x != 0xFC00) {
+                    last = sycl::max(last, k + 1);
+                }
+                if ((x & 0x7FFF) != 0) {
+                    first = sycl::min(first, k);
+                }
+            }
+        }
+        last  = sycl::reduce_over_group(it.get_group(), last, sycl::maximum<int>());
+        first = sycl::reduce_over_group(it.get_group(), first, sycl::minimum<int>());
+        if (li == 0) {
+            end[it.get_group(0)]  = sycl::min(nkv, (last + 63) / 64 * 64);
+            zero[it.get_group(0)] = first;
         }
     });
 }
@@ -815,7 +1062,14 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
     }
 
     std::optional<ggml_sycl_pool_alloc<int>> kv_end_pool;
-    if (mask && nq * nkv * (D + DV) >= XMX_KV_END_MIN) {
+    std::optional<ggml_sycl_pool_alloc<int>> kv_zero_pool;
+    if (mask && D == 256) {
+        kv_end_pool.emplace(ctx.pool(), (size_t) (nq + TM - 1) / TM);
+        kv_zero_pool.emplace(ctx.pool(), (size_t) (nq + TM - 1) / TM);
+        fattn_xmx_kv_bounds(p.mask, kv_end_pool->get(), kv_zero_pool->get(), p.nq, p.nkv, TM, p.mask_s1, stream);
+        p.kv_end  = kv_end_pool->get();
+        p.kv_zero = kv_zero_pool->get();
+    } else if (mask && nq * nkv * (D + DV) >= XMX_KV_END_MIN) {
         kv_end_pool.emplace(ctx.pool(), (size_t) (nq + TM - 1) / TM);
         fattn_xmx_kv_end(p.mask, kv_end_pool->get(), p.nq, p.nkv, TM, p.mask_s1, stream);
         p.kv_end = kv_end_pool->get();
@@ -831,7 +1085,27 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
         q_fused ? fattn_xmx_launch<128, 128, 8, 64, true, true>(stream, p)
                 : fattn_xmx_launch<128, 128, 8, 64, true, false>(stream, p);
     } else {
-        fattn_xmx_launch<256, 256, 8, 32, false, false>(stream, p);
+        const int64_t nqb    = (nq + 8 * XMX_NSG - 1) / (8 * XMX_NSG);
+        const bool    packed = (H / p.Hkv) * nqb % XMX_D256_HPW == 0;
+        const int     nsg    = packed ? XMX_NSG * XMX_D256_HPW : XMX_NSG;
+        const int64_t hpw    = packed ? XMX_D256_HPW : 1;
+        const fattn_xmx_plan plan = fattn_xmx_plan_split(ctx.device, nsg, nqb * H * mb / hpw, nkv);
+        if (plan.full > 0) {
+            packed ? fattn_xmx_launch<256, 256, 8, 32, false, false, false, XMX_NSG * XMX_D256_HPW>(stream, p, plan.full)
+                   : fattn_xmx_launch<256, 256, 8, 32, false, false>(stream, p, plan.full);
+        }
+        if (plan.tail > 0) {
+            ggml_sycl_pool_alloc<float>        part(ctx.pool(), (size_t) plan.nsplit * mb * nq * H * DV);
+            ggml_sycl_pool_alloc<sycl::float2> part_ml(ctx.pool(), (size_t) plan.nsplit * mb * H * nq);
+            p.part    = part.get();
+            p.part_ml = part_ml.get();
+            p.nsplit  = plan.nsplit;
+            p.rb0     = (int) (plan.full * hpw);
+            p.nrb     = (int) (plan.tail * hpw);
+            packed ? fattn_xmx_launch<256, 256, 8, 32, false, false, true, XMX_NSG * XMX_D256_HPW>(stream, p)
+                   : fattn_xmx_launch<256, 256, 8, 32, false, false, true>(stream, p);
+            fattn_xmx_combine(p, DV, packed, stream);
+        }
     }
 #endif
 }

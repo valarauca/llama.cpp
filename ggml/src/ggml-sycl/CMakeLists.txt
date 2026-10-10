@@ -243,8 +243,18 @@ if (GGML_SYCL_AOT_DEVICES)
     endif()
     set(GGML_SYCL_MAX_PARALLEL_LINK_JOBS ${_ggml_sycl_nproc} CACHE STRING
         "Parallel ocloc jobs for spir64_gen AOT device-image lowering")
+
+    # A static ggml-sycl is never linked on its own, so the final executable has to run the
+    # AOT device link. Without it the spir64_gen-only objects leave no kernels in the binary.
+    get_target_property(_ggml_sycl_type ggml-sycl TYPE)
+    if (_ggml_sycl_type STREQUAL "STATIC_LIBRARY")
+        set(_ggml_sycl_aot_link_scope INTERFACE)
+    else()
+        set(_ggml_sycl_aot_link_scope PRIVATE)
+    endif()
     target_link_options(
-        ggml-sycl PRIVATE
+        ggml-sycl ${_ggml_sycl_aot_link_scope}
+        -fsycl
         -fsycl-targets=spir64_gen
         "SHELL:-Xsycl-target-backend=spir64_gen \"-device ${GGML_SYCL_AOT_DEVICES}\""
         -fsycl-max-parallel-link-jobs=${GGML_SYCL_MAX_PARALLEL_LINK_JOBS}

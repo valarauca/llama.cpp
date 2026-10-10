@@ -13,10 +13,13 @@
 #ifndef GGML_SYCL_COMMON_HPP
 #define GGML_SYCL_COMMON_HPP
 
+#include <atomic>
 #include <cstddef>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "base.hpp"
 #include "dpct/helper.hpp"
@@ -61,15 +64,20 @@ void ggml_sycl_host_free(void* ptr);
 
 
 extern int g_ggml_sycl_debug;
+// Bumped whenever device memory or weight layout that a recorded SYCL graph may reference changes
+// (weight reorder, scratch buffer reallocation), so cached graphs are re-recorded before replay.
+extern std::atomic<uint64_t> g_ggml_sycl_graph_epoch;
 extern int g_ggml_sycl_enable_optimize;
 extern int g_ggml_sycl_enable_fusion;
 extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_mmvq_wide;
 extern int g_ggml_sycl_prioritize_dmmv;
+extern int g_ggml_sycl_fp16_gemm;
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_fa_onednn;
 extern int g_ggml_sycl_fa_onednn_max_kv;
+extern int g_ggml_sycl_fa_xmx;
 extern int g_ggml_sycl_enable_mkl_fa;
 extern int g_ggml_sycl_memtrace;
 extern int g_ggml_sycl_memtrace_step;
@@ -216,6 +224,7 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
 struct optimize_feature {
     bool reorder=false;
     bool onednn_optimized_gemm=false;
+    bool fp16_gemm=false;
 };
 
 struct sycl_device_info {
@@ -335,10 +344,33 @@ struct mmid_row_mapping {
 };
 
 namespace sycl_ex = sycl::ext::oneapi::experimental;
+// The last q8_1-quantized src1 of a mat-mul, kept so sibling mat-muls reading the same activation
+// (Q/K/V, GDN projections) skip requantizing it. Valid until a graph node writes into [src, src + src_bytes).
+// Only the top-level MUL_MAT graph node being computed (node) may use it, never internal sub-mat-muls.
+struct ggml_sycl_q8_1_cache {
+    const ggml_tensor * node = nullptr;
+    queue_ptr    q         = nullptr;
+    void *       buf       = nullptr;
+    size_t       cap       = 0;
+    const void * src       = nullptr;
+    size_t       src_bytes = 0;
+    size_t       layout    = 0;
+    int64_t      ne10      = 0;
+    int64_t      nrows     = 0;
+    int64_t      padded    = 0;
+
+    ~ggml_sycl_q8_1_cache() {
+        if (buf != nullptr) {
+            sycl::free(buf, *q);
+        }
+    }
+};
+
 struct ggml_backend_sycl_context {
     int device;
     std::string name;
     optimize_feature opt_feature;
+    ggml_sycl_q8_1_cache q8_1_cache;
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
@@ -443,7 +475,24 @@ struct ggml_backend_sycl_context {
     }
 
 #ifdef GGML_SYCL_GRAPH
-    std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+    // One recorded graph per ggml graph key, replayed while the node properties stay identical.
+    struct sycl_graph {
+        struct node_properties {
+            ggml_tensor node;
+            void *      src_data[GGML_MAX_SRC];
+            int64_t     src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
+            size_t      src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+        };
+
+        std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+        std::vector<node_properties> node_props;
+        uint64_t                     uid             = 0;
+        uint64_t                     epoch           = 0;
+        bool                         warmup_complete = false;
+    };
+
+    static constexpr size_t max_sycl_graphs = 32;
+    std::unordered_map<const void *, sycl_graph> sycl_graphs;
 #endif
 
     ggml_sycl_pool & host_pool(int device) {

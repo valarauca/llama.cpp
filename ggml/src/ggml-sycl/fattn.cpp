@@ -20,6 +20,7 @@
 #include "fattn.hpp"
 #include "fattn-onednn.hpp"
 #include "fattn-sparse.hpp"
+#include "fattn-xmx.hpp"
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
@@ -97,12 +98,14 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
+    BEST_FATTN_KERNEL_XMX      = 120, // joint_matrix (DPAS) kernel, default for prefill, GGML_SYCL_FA_XMX=0 disables
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_MKL      = 300,
 };
 
-
+// GGML_SYCL_FA_KERNEL=tile|onednn|xmx forces that kernel whenever it supports the op. It is read
+// on every call so a single process can A/B the kernels on identical inputs.
 static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef SYCL_FLASH_ATTN
     GGML_UNUSED(dst);
@@ -129,10 +132,21 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    const char * forced     = getenv("GGML_SYCL_FA_KERNEL");
+    const bool   force_any  = forced && *forced && strcmp(forced, "auto") != 0;
+    const bool   force_tile = force_any && strcmp(forced, "tile") == 0;
+    if (force_any && strcmp(forced, "onednn") == 0 && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
+        return BEST_FATTN_KERNEL_ONEDNN;
+    }
+    if (((force_any && strcmp(forced, "xmx") == 0) || (!force_any && g_ggml_sycl_fa_xmx && (Q->ne[1] >= 32 || K->ne[0] == 576))) &&
+        ggml_sycl_flash_attn_ext_xmx_supported(dst)) {
+        return BEST_FATTN_KERNEL_XMX;
+    }
+
     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
     // calling _supported() on every decode FA call.
-    if (Q->ne[1] >= 32
+    if (!force_tile && Q->ne[1] >= 32
         && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
@@ -152,7 +166,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // head_dim 512, so the cap must include it. Head sizes not a multiple of
     // 64 (72/80/96), MHA (gqa_ratio == 1), and MLA (DKQ != DV, e.g. 576/512)
     // fall through to TILE/VEC; see follow-up work.
-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
+    if (!force_tile && g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
         Q->ne[0] >= 64 && Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 &&
         Q->ne[0] == V->ne[0] &&
         Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
@@ -247,8 +261,12 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     // Fused-XMX path: oneDNN Graph SDPA (flash attention). Strictly
     // additive -- taken only when statically supported, otherwise falls through to VEC/TILE below.
-    if (ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
+    if (!force_tile && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
+    }
+
+    if (force_tile) {
+        return BEST_FATTN_KERNEL_TILE;
     }
 
     // If there are no tensor cores available, use the generic tile kernel:
@@ -297,6 +315,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         if (k == BEST_FATTN_KERNEL_MKL)  kname = "MKL";
         if (k == BEST_FATTN_KERNEL_ONEDNN)  kname = "ONEDNN";
         if (k == BEST_FATTN_KERNEL_VEC)  kname = "VEC";
+        if (k == BEST_FATTN_KERNEL_XMX)  kname = "XMX";
         int64_t delta = 0;
         if (Dk == 256) {
             delta = cur_nkv - last_nkv_d256;
@@ -331,6 +350,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MKL:
             ggml_sycl_flash_attn_ext_mkl(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_XMX:
+            ggml_sycl_flash_attn_ext_xmx(ctx, dst);
             break;
     }
 
@@ -432,6 +454,9 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
             need_K = (size_t) ggml_nelements(K);
             need_V = (size_t) ggml_nelements(V);
         }
+    }
+    if (g_ggml_sycl_fa_xmx && ggml_sycl_flash_attn_ext_xmx_needs_q_f16(dst)) {
+        need_Q = std::max(need_Q, (size_t) H * q * d * Q->ne[3]);
     }
     if (tile_needs_K) {
         need_K = std::max(need_K, (size_t) ggml_nelements(K));

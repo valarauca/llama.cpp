@@ -298,6 +298,11 @@ endif()
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
+
+    if (GGML_SYCL)
+        # A/B of the SYCL flash-attention kernels against the CPU, needs a SYCL device
+        llama_build(test-fattn-ab.cpp)
+    endif()
     llama_build_and_test(test-quantize-fns.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)

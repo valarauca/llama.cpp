@@ -45,7 +45,7 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
     const ggml_tensor * sinks = dst->src[4];
 
     // F16 KV: native SDPA at any KV length.
-    // Non-F16: dequant to F16 then SDPA at prefill lengths. Only the
+    // Non-F16: dequant to F16 then SDPA for prefill (Q >= 32), at any KV length. Only the
     // standard quantized KV cache types (Q4_0-Q8_0) and F32 are accepted
     // because their to_fp16_sycl conversion is verified. BF16 and IQ*
     // are excluded: BF16 needs a strided conversion kernel that does not
@@ -60,7 +60,7 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
         if (!k_ok || !v_ok) {
             return false;
         }
-        if (use_shape_limit && (Q->ne[1] < 32 || K->ne[1] < 1024)) {
+        if (use_shape_limit && Q->ne[1] < 32) {
             return false;
         }
         for (const ggml_tensor * t : {K, V}) {
@@ -87,11 +87,10 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
         return false;
     }
     // gate for the following cases
-    // 1. if the oneDNN graph Add node has no input --> skip
-    // 2. types other than f16 need different logical_tensor declaration
-    // 3. the mask must be shape [1, 1, q, seq]
-    // 4. sinks: excludes attention sink (Xiao et al., 2024) that can't be modeled by oneDNN graph
-    if (!mask || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1 || sinks) {
+    // 1. a mask of a type other than f16 needs a different logical_tensor declaration
+    // 2. a mask must be shape [1, 1, q, seq]; without one the graph omits the Add node
+    // 3. sinks: excludes attention sink (Xiao et al., 2024) that can't be modeled by oneDNN graph
+    if ((mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1)) || sinks) {
         return false;
     }
     float max_bias = 0.0f, logit_softcap = 0.0f;
@@ -165,9 +164,10 @@ struct sdpa_partition {
     bool   ok = false;
 };
 
-// Build + compile the contiguous-input GQA SDPA graph (MatMul->Divide->Add->SoftMax->MatMul), f32 out.
+// Build + compile the contiguous-input GQA SDPA graph (MatMul->Divide->[Add]->SoftMax->MatMul), f32 out.
+// The mask Add is only part of the graph when has_mask is set; unmasked attention (e.g. DiT) omits it.
 // Mirrors the hardware-verified scratch/onednn_sdpa_probe.cpp build_gqa (partitions=1, sdp_primitive_kernel_t).
-static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int seq, int d,
+static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int seq, int d, bool has_mask,
                                  const std::array<int64_t, 5> & k_str, const std::array<int64_t, 5> & v_str) try {
     using ltype = logical_tensor::layout_type;
     using dt    = logical_tensor::data_type;
@@ -201,7 +201,7 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
     auto smax   = op(id++, op::kind::SoftMax, "softmax");
     smax.set_attr<int64_t>(op::attr::axis, -1);
     smax.set_attr<std::string>(op::attr::mode, "inf_as_zero");
-    smax.add_inputs({masked}); smax.add_outputs({probs});
+    smax.add_inputs({has_mask ? masked : scaled}); smax.add_outputs({probs});
 
     auto value  = logical_tensor(id++, t,  kv_sz, v_st);
     // f16 output is REQUIRED to hit sdp_primitive_kernel_t (the systolic micro-kernel); an f32 output
@@ -212,7 +212,11 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int 
     bmm2.add_inputs({probs, value}); bmm2.add_outputs({output});
 
     dnnl::graph::graph g(eng.get_kind());
-    g.add_op(bmm1); g.add_op(sdiv); g.add_op(madd); g.add_op(smax); g.add_op(bmm2);
+    g.add_op(bmm1); g.add_op(sdiv);
+    if (has_mask) {
+        g.add_op(madd);
+    }
+    g.add_op(smax); g.add_op(bmm2);
     g.finalize();
 
     auto parts = g.get_partitions();
@@ -306,26 +310,15 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         {
             const char * K_data = (const char *)K->data;
             const bool k_non_dense = ((int64_t)K->ne[1] * K->nb[1] != K->nb[2]) && K->ne[2] > 1;
-            const bool k_gemma = k_non_dense &&
-                ((int64_t)K->nb[2] < (int64_t)K->ne[1] * (int64_t)K->nb[1]);
             if (ggml_is_contiguously_allocated(K) && !k_non_dense) {
                 to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(K->type, dst);
                 to_fp16(K_data, K_ptr, ggml_nelements(K), stream);
             } else {
-                const size_t bs = ggml_blck_size(K->type);
                 const size_t ts = ggml_type_size(K->type);
                 to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(K->type);
-                int64_t s01, s02, s03;
-                if (k_gemma) {
-                    const int64_t blk_per_row = (int64_t)K->ne[0] / bs;
-                    s01 = (int64_t)Hkv * blk_per_row;
-                    s02 = blk_per_row;
-                    s03 = (int64_t)K->ne[1] * s01;
-                } else {
-                    s01 = (int64_t)K->nb[1] / ts;
-                    s02 = (int64_t)K->nb[2] / ts;
-                    s03 = (int64_t)K->nb[3] / ts;
-                }
+                const int64_t s01 = (int64_t)K->nb[1] / ts;
+                const int64_t s02 = (int64_t)K->nb[2] / ts;
+                const int64_t s03 = (int64_t)K->nb[3] / ts;
                 to_fp16(K_data, K_ptr,
                         K->ne[0], K->ne[1], K->ne[2], K->ne[3],
                         s01, s02, s03, stream);
@@ -340,26 +333,15 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         {
             const char * V_data = (const char *)V->data;
             const bool v_non_dense = ((int64_t)V->ne[1] * V->nb[1] != V->nb[2]) && V->ne[2] > 1;
-            const bool v_gemma = v_non_dense &&
-                ((int64_t)V->nb[2] < (int64_t)V->ne[1] * (int64_t)V->nb[1]);
             if (ggml_is_contiguously_allocated(V) && !v_non_dense) {
                 to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(V->type, dst);
                 to_fp16(V_data, V_ptr, ggml_nelements(V), stream);
             } else {
-                const size_t bs = ggml_blck_size(V->type);
                 const size_t ts = ggml_type_size(V->type);
                 to_fp16_nc_sycl_t to_fp16 = ggml_get_to_fp16_nc_sycl(V->type);
-                int64_t s01, s02, s03;
-                if (v_gemma) {
-                    const int64_t blk_per_row = (int64_t)V->ne[0] / bs;
-                    s01 = (int64_t)V->ne[2] * blk_per_row;
-                    s02 = blk_per_row;
-                    s03 = (int64_t)V->ne[1] * s01;
-                } else {
-                    s01 = (int64_t)V->nb[1] / ts;
-                    s02 = (int64_t)V->nb[2] / ts;
-                    s03 = (int64_t)V->nb[3] / ts;
-                }
+                const int64_t s01 = (int64_t)V->nb[1] / ts;
+                const int64_t s02 = (int64_t)V->nb[2] / ts;
+                const int64_t s03 = (int64_t)V->nb[3] / ts;
                 to_fp16(V_data, V_ptr,
                         V->ne[0], V->ne[1], V->ne[2], V->ne[3],
                         s01, s02, s03, stream);
@@ -404,13 +386,15 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     // repeats stride 1 and stride 4 is always 1, so the key covers every entry that can differ.
     static std::unordered_map<std::string, sdpa_partition> cache;
     char keyb[256];
-    snprintf(keyb, sizeof(keyb), "%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld", ggml_sycl_get_device(),
-             (long long) H, (long long) Hkv, (long long) q, (long long) seq, (long long) d,
+    const bool has_mask = mask != nullptr;
+    snprintf(keyb, sizeof(keyb), "%d:%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld", ggml_sycl_get_device(),
+             (int) has_mask, (long long) H, (long long) Hkv, (long long) q, (long long) seq, (long long) d,
              (long long) k_str[0], (long long) k_str[1], (long long) k_str[3],
              (long long) v_str[0], (long long) v_str[1], (long long) v_str[3]);
     auto it = cache.find(keyb);
     if (it == cache.end()) {
-        it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str)).first;
+        it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, has_mask,
+                                            k_str, v_str)).first;
     }
     sdpa_partition & E = it->second;
     if (!E.ok) {
@@ -424,7 +408,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
         if (r == E.id_k)     return K_ptr;
         if (r == E.id_v)     return V_ptr;
         if (r == E.id_scale) return scale_dev;
-        if (r == E.id_mask)  return (void *) mask->data;
+        if (r == E.id_mask)  return has_mask ? (void *) mask->data : nullptr;
         return nullptr;
     };
     std::vector<tensor> ti;

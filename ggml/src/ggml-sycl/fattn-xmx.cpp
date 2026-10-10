@@ -2,6 +2,7 @@
 #include "fattn.hpp"
 #include "fattn-tile.hpp"
 
+#include <array>
 #include <cmath>
 #include <optional>
 
@@ -633,6 +634,52 @@ static bool fattn_xmx_q_fused(const ggml_tensor * Q) {
     return Q->ne[0] != 256 && Q->nb[1] % 16 == 0 && Q->nb[1] >= 64 && Q->nb[2] % 64 == 0;
 }
 
+static bool fattn_xmx_kv_type_ok(ggml_type type) {
+    return type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0;
+}
+
+static bool fattn_xmx_v_is_k_view(const ggml_tensor * K, const ggml_tensor * V) {
+    return V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+}
+
+// Byte strides of K or V as the kernel reads them: the tensor itself for f16, otherwise the f16
+// copy fattn_xmx_stage() makes, which keeps the source layout when the source is contiguously
+// allocated (a KV cache view) and is dense otherwise.
+static std::array<size_t, 3> fattn_xmx_f16_strides(const ggml_tensor * t) {
+    if (t->type == GGML_TYPE_F16) {
+        return { t->nb[1], t->nb[2], t->nb[3] };
+    }
+    if (ggml_is_contiguously_allocated(t)) {
+        const size_t bs = ggml_blck_size(t->type);
+        const size_t ts = ggml_type_size(t->type);
+        return { t->nb[1] / ts * bs * sizeof(sycl::half), t->nb[2] / ts * bs * sizeof(sycl::half),
+                 t->nb[3] / ts * bs * sizeof(sycl::half) };
+    }
+    const size_t s1 = t->ne[0] * sizeof(sycl::half);
+    return { s1, s1 * t->ne[1], s1 * t->ne[1] * t->ne[2] };
+}
+
+// Quantized K or V -> f16 in `buf` (scratch reserved with the op), or in the pool when nothing was
+// reserved, laid out as fattn_xmx_f16_strides() describes. f16 tensors are used in place.
+static const sycl::half * fattn_xmx_stage(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const ggml_tensor * t,
+                                          sycl::half * buf, std::optional<ggml_sycl_pool_alloc<sycl::half>> & pool_buf) {
+    if (t->type == GGML_TYPE_F16) {
+        return (const sycl::half *) t->data;
+    }
+    if (!buf) {
+        pool_buf.emplace(ctx.pool(), (size_t) ggml_nelements(t));
+        buf = pool_buf->get();
+    }
+    if (ggml_is_contiguously_allocated(t)) {
+        ggml_get_to_fp16_sycl(t->type, dst)(t->data, buf, ggml_nelements(t), ctx.stream());
+    } else {
+        const size_t ts = ggml_type_size(t->type);
+        ggml_get_to_fp16_nc_sycl(t->type)(t->data, buf, t->ne[0], t->ne[1], t->ne[2], t->ne[3], t->nb[1] / ts,
+                                          t->nb[2] / ts, t->nb[3] / ts, ctx.stream());
+    }
+    return buf;
+}
+
 #endif // GGML_SYCL_FA_XMX
 
 bool ggml_sycl_flash_attn_ext_xmx_supported(const ggml_tensor * dst) {
@@ -650,7 +697,7 @@ bool ggml_sycl_flash_attn_ext_xmx_supported(const ggml_tensor * dst) {
     if (caps.dpas_n != XMX_SG || !caps.block_2d_io) {
         return false;
     }
-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || sinks) {
+    if (Q->type != GGML_TYPE_F32 || !fattn_xmx_kv_type_ok(K->type) || !fattn_xmx_kv_type_ok(V->type) || sinks) {
         return false;
     }
     const int64_t D   = K->ne[0];
@@ -679,8 +726,9 @@ bool ggml_sycl_flash_attn_ext_xmx_supported(const ggml_tensor * dst) {
         if (t->ne[3] != 1 && t->ne[3] != Q->ne[3]) {
             return false;
         }
-        if (t->nb[0] != sizeof(sycl::half) || (uintptr_t) t->data % 64 != 0 || t->nb[1] % 16 != 0 || t->nb[1] < 64 ||
-            t->nb[2] % 64 != 0 || t->nb[3] % 64 != 0) {
+        const std::array<size_t, 3> s = fattn_xmx_f16_strides(t);
+        if (t->nb[0] != ggml_type_size(t->type) || (t->type == GGML_TYPE_F16 && (uintptr_t) t->data % 64 != 0) ||
+            s[0] % 16 != 0 || s[0] < 64 || s[1] % 64 != 0 || s[2] % 64 != 0) {
             return false;
         }
     }
@@ -721,17 +769,26 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
     const bool    mla = D == XMX_MLA_DK;
     const int     TM  = mla ? 1 : D == 64 ? 16 : 8;
 
+    const ggml_sycl_fattn_extra                     extra  = ggml_sycl_fattn_get_extra(dst);
+    const bool                                      v_on_k = K->type != GGML_TYPE_F16 && fattn_xmx_v_is_k_view(K, V);
+    std::optional<ggml_sycl_pool_alloc<sycl::half>> K_pool;
+    std::optional<ggml_sycl_pool_alloc<sycl::half>> V_pool;
+    const sycl::half * Kh = fattn_xmx_stage(ctx, dst, K, (sycl::half *) extra.K_buffer_ptr, K_pool);
+    const sycl::half * Vh = v_on_k ? Kh : fattn_xmx_stage(ctx, dst, V, (sycl::half *) extra.V_buffer_ptr, V_pool);
+    const std::array<size_t, 3> ks = fattn_xmx_f16_strides(K);
+    const std::array<size_t, 3> vs = v_on_k ? ks : fattn_xmx_f16_strides(V);
+
     fattn_xmx_params p{};
-    p.K       = (const sycl::half *) K->data;
-    p.V       = (const sycl::half *) V->data;
+    p.K       = Kh;
+    p.V       = Vh;
     p.mask    = mask ? (const sycl::half *) mask->data : nullptr;
     p.dst     = (float *) dst->data;
-    p.k_s1    = K->nb[1] / sizeof(sycl::half);
-    p.k_s2    = K->nb[2] / sizeof(sycl::half);
-    p.k_s3    = K->ne[3] == 1 ? 0 : K->nb[3] / sizeof(sycl::half);
-    p.v_s1    = V->nb[1] / sizeof(sycl::half);
-    p.v_s2    = V->nb[2] / sizeof(sycl::half);
-    p.v_s3    = V->ne[3] == 1 ? 0 : V->nb[3] / sizeof(sycl::half);
+    p.k_s1    = ks[0] / sizeof(sycl::half);
+    p.k_s2    = ks[1] / sizeof(sycl::half);
+    p.k_s3    = K->ne[3] == 1 ? 0 : ks[2] / sizeof(sycl::half);
+    p.v_s1    = vs[0] / sizeof(sycl::half);
+    p.v_s2    = vs[1] / sizeof(sycl::half);
+    p.v_s3    = V->ne[3] == 1 ? 0 : vs[2] / sizeof(sycl::half);
     p.mask_s1 = mask ? mask->nb[1] / sizeof(sycl::half) : 0;
     p.nq      = (int) nq;
     p.nkv     = (int) nkv;
@@ -748,8 +805,7 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
         p.q_s2 = Q->nb[2] / sizeof(float);
         p.q_s3 = Q->nb[3] / sizeof(float);
     } else {
-        const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
-        sycl::half *                Qh    = (sycl::half *) extra.Q_buffer_ptr;
+        sycl::half * Qh = (sycl::half *) extra.Q_buffer_ptr;
         if (!Qh) {
             Qh_pool.emplace(ctx.pool(), (size_t) D * nq * H * mb);
             Qh = Qh_pool->get();

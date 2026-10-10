@@ -4,7 +4,8 @@
 #include "common.hpp"
 
 // Static check for the joint_matrix (XMX/DPAS) flash-attention kernel: SIMD16 DPAS device,
-// f32 Q, f16 K/V with head_dim 64, 128, 256 or MLA 576/512, optional f16 mask, no sinks/ALiBi/softcap.
+// f32 Q, f16/q8_0/q4_0 K/V (quantized K/V are converted to f16 first) with head_dim 64, 128, 256
+// or MLA 576/512, optional f16 mask, no sinks/ALiBi/softcap.
 bool ggml_sycl_flash_attn_ext_xmx_supported(const ggml_tensor * dst);
 
 // True when the kernel stages a dense f16 copy of Q (head_dim 256, or Q strides the fused f32

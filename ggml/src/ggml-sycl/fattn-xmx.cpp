@@ -275,7 +275,7 @@ static bool fattn_xmx_layout_ok(int device, dpct::queue_ptr stream) {
         return checked[device] > 0;
     }
 
-    sycl::queue q(stream->get_context(), stream->get_device());
+    sycl::queue q(stream->get_context(), stream->get_device(), sycl::property::queue::in_order{});
     int *       bad = sycl::malloc_device<int>(1, q);
     q.memset(bad, 0, sizeof(int));
     q.parallel_for(sycl::nd_range<1>(XMX_SG, XMX_SG), fattn_xmx_layout_probe{ bad });

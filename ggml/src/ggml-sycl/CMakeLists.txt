@@ -191,6 +191,24 @@ if (GGML_SYCL_XE_FAMILIES)
     message(STATUS "GGML_SYCL_XE_FAMILIES=${GGML_SYCL_AOT_DEVICES}")
 endif()
 
+# The joint_matrix flash-attention kernel uses SIMD16 DPAS tiles, and IGC crashes compiling it for
+# SIMD8-DPAS or non-XMX targets (e.g. acm-g10, mtl-h). JIT builds only compile it on first use,
+# which the runtime family check limits to SIMD16 DPAS devices, so only AOT target lists are gated.
+set(_ggml_sycl_fa_xmx ON)
+if (GGML_SYCL_AOT_DEVICES)
+    string(REPLACE "," ";" _ggml_sycl_aot_list "${GGML_SYCL_AOT_DEVICES}")
+    foreach(_dev IN LISTS _ggml_sycl_aot_list)
+        if (NOT _dev MATCHES "^(xe-hpc|xe2-.*|xe3-.*|xe3p-.*|pvc.*|bmg-.*|lnl-.*|ptl-.*|wcl.*)$")
+            set(_ggml_sycl_fa_xmx OFF)
+        endif()
+    endforeach()
+endif()
+if (_ggml_sycl_fa_xmx)
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_FA_XMX)
+else()
+    message(STATUS "XMX flash attention disabled: an AOT target lacks SIMD16 DPAS")
+endif()
+
 if (GGML_SYCL_TARGET STREQUAL "INTEL")
     add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
     if (NOT GGML_SYCL_AOT_DEVICES)

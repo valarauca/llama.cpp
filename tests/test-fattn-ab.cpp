@@ -30,6 +30,7 @@ struct fa_shape {
     int64_t      Hkv;
     bool         causal;
     bool         token_major;
+    int64_t      Dv;
 };
 
 struct fa_inputs {
@@ -86,7 +87,7 @@ static fa_inputs make_inputs(const fa_shape & s) {
     fa_inputs                       in;
     in.q.resize(s.D * s.nq * s.H);
     in.k.resize(s.D * s.nkv * s.Hkv);
-    in.v.resize(s.D * s.nkv * s.Hkv);
+    in.v.resize(s.Dv * s.nkv * s.Hkv);
     for (auto & x : in.q) {
         x = nd(rng);
     }
@@ -117,14 +118,14 @@ static void build(fa_graph & g, const fa_shape & s, const fa_inputs & in, ggml_b
     if (s.token_major) {
         g.q = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, s.D, s.H, s.nq, 1);
         g.k = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, s.D, s.Hkv, s.nkv, 1);
-        g.v = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, s.D, s.Hkv, s.nkv, 1);
+        g.v = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, s.Dv, s.Hkv, s.nkv, 1);
         q   = ggml_permute(g.ctx, g.q, 0, 2, 1, 3);
         k   = ggml_permute(g.ctx, g.k, 0, 2, 1, 3);
         v   = ggml_permute(g.ctx, g.v, 0, 2, 1, 3);
     } else {
         g.q = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F32, s.D, s.nq, s.H, 1);
         g.k = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, s.D, s.nkv, s.Hkv, 1);
-        g.v = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, s.D, s.nkv, s.Hkv, 1);
+        g.v = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, s.Dv, s.nkv, s.Hkv, 1);
         q   = g.q;
         k   = g.k;
         v   = g.v;
@@ -181,12 +182,15 @@ int main(int argc, char ** argv) {
     ggml_backend_cpu_set_n_threads(cpu, (int) std::max(1u, std::thread::hardware_concurrency()));
 
     const fa_shape shapes[] = {
-        { "dit-4096x4096-h24",        128, 4096, 4096, 24, 24, false, true  },
-        { "dit-4096x4121-h24",        128, 4096, 4121, 24, 24, false, true  },
-        { "llm-gqa-causal-512x1024",  128,  512, 1024, 32,  8, true,  false },
-        { "llm-gqa-causal-77x333",    128,   77,  333, 32,  8, true,  false },
-        { "d64-causal-1000x1000-h16",  64, 1000, 1000, 16, 16, true,  false },
-        { "d64-unmasked-1024x1024",    64, 1024, 1024, 16, 16, false, true  },
+        { "dit-4096x4096-h24",        128, 4096, 4096, 24, 24, false, true,  128 },
+        { "dit-4096x4121-h24",        128, 4096, 4121, 24, 24, false, true,  128 },
+        { "llm-gqa-causal-512x1024",  128,  512, 1024, 32,  8, true,  false, 128 },
+        { "llm-gqa-causal-77x333",    128,   77,  333, 32,  8, true,  false, 128 },
+        { "llm-gqa-causal-4096x4096", 128, 4096, 4096, 32,  8, true,  false, 128 },
+        { "d64-causal-1000x1000-h16",  64, 1000, 1000, 16, 16, true,  false,  64 },
+        { "d64-unmasked-1024x1024",    64, 1024, 1024, 16, 16, false, true,   64 },
+        { "d256-gqa-causal-512x1024", 256,  512, 1024, 16,  8, true,  false, 256 },
+        { "mla-576-512-causal-512x1024", 576, 512, 1024, 16, 1, true, false, 512 },
     };
     const char * kernels[] = { "tile", "onednn", "xmx" };
     const double nmse_max  = 5e-4;
@@ -205,7 +209,7 @@ int main(int argc, char ** argv) {
         ggml_backend_graph_compute(cpu, ref_g.gf);
         const std::vector<float> ref = read_out(ref_g);
 
-        const double flops = 4.0 * (double) s.H * s.nq * s.nkv * s.D;
+        const double flops = 2.0 * (double) s.H * s.nq * s.nkv * (s.D + s.Dv);
         for (const char * kernel : kernels) {
             set_env("GGML_SYCL_FA_KERNEL", kernel);
             fa_graph g;

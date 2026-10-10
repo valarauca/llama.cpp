@@ -138,7 +138,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     if (force_any && strcmp(forced, "onednn") == 0 && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
-    if (((force_any && strcmp(forced, "xmx") == 0) || (!force_any && g_ggml_sycl_fa_xmx && Q->ne[1] >= 32)) &&
+    if (((force_any && strcmp(forced, "xmx") == 0) || (!force_any && g_ggml_sycl_fa_xmx && (Q->ne[1] >= 32 || K->ne[0] == 576))) &&
         ggml_sycl_flash_attn_ext_xmx_supported(dst)) {
         return BEST_FATTN_KERNEL_XMX;
     }
@@ -455,7 +455,7 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
             need_V = (size_t) ggml_nelements(V);
         }
     }
-    if (g_ggml_sycl_fa_xmx && ggml_sycl_flash_attn_ext_xmx_supported(dst)) {
+    if (g_ggml_sycl_fa_xmx && ggml_sycl_flash_attn_ext_xmx_needs_q_f16(dst)) {
         need_Q = std::max(need_Q, (size_t) H * q * d * Q->ne[3]);
     }
     if (tile_needs_K) {

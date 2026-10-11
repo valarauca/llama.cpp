@@ -135,11 +135,11 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     const char * forced     = getenv("GGML_SYCL_FA_KERNEL");
     const bool   force_any  = forced && *forced && strcmp(forced, "auto") != 0;
     const bool   force_tile = force_any && strcmp(forced, "tile") == 0;
-    if (force_any && strcmp(forced, "onednn") == 0 && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
+    if (force_any && strcmp(forced, "onednn") == 0 && ggml_sycl_flash_attn_ext_onednn_supported(device, dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
     if (((force_any && strcmp(forced, "xmx") == 0) || (!force_any && g_ggml_sycl_fa_xmx && (Q->ne[1] >= 32 || K->ne[0] == 576))) &&
-        ggml_sycl_flash_attn_ext_xmx_supported(dst)) {
+        ggml_sycl_flash_attn_ext_xmx_supported(device, dst)) {
         return BEST_FATTN_KERNEL_XMX;
     }
 
@@ -147,7 +147,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
     // calling _supported() on every decode FA call.
     if (!force_tile && Q->ne[1] >= 32
-        && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
+        && ggml_sycl_flash_attn_ext_onednn_supported(device, dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
 
@@ -261,7 +261,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     // Fused-XMX path: oneDNN Graph SDPA (flash attention). Strictly
     // additive -- taken only when statically supported, otherwise falls through to VEC/TILE below.
-    if (!force_tile && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
+    if (!force_tile && ggml_sycl_flash_attn_ext_onednn_supported(device, dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
 
@@ -415,7 +415,7 @@ static uintptr_t ggml_sycl_fattn_reserve_halves(ggml_sycl_fattn_extra & extra, s
     return block;
 }
 
-ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
+ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(int device, const ggml_tensor * dst) {
     ggml_sycl_fattn_extra extra;
 
     extra.end = (uintptr_t) dst->data + ggml_nbytes(dst);
@@ -436,7 +436,7 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
     const int64_t q = Q->ne[1];
 
     // calculate the worst-case memory consumption across all kernels
-    const bool onednn_supported = ggml_sycl_flash_attn_ext_onednn_supported(dst, /* use_shape_limit */ false);
+    const bool onednn_supported = ggml_sycl_flash_attn_ext_onednn_supported(device, dst, /* use_shape_limit */ false);
 
     const bool tile_needs_K = K->type != GGML_TYPE_F16;
     const bool tile_needs_V = V->type != GGML_TYPE_F16;
@@ -455,7 +455,7 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
             need_V = (size_t) ggml_nelements(V);
         }
     }
-    if (g_ggml_sycl_fa_xmx && ggml_sycl_flash_attn_ext_xmx_needs_q_f16(dst)) {
+    if (g_ggml_sycl_fa_xmx && ggml_sycl_flash_attn_ext_xmx_needs_q_f16(device, dst)) {
         need_Q = std::max(need_Q, (size_t) H * q * d * Q->ne[3]);
     }
     if (tile_needs_K) {
@@ -476,7 +476,7 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
     return extra;
 }
 
-size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst) {
-    const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
+size_t ggml_sycl_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
+    const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(device, dst);
     return (size_t) (extra.end - (uintptr_t) dst->data);
 }

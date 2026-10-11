@@ -940,7 +940,7 @@ void launch_fattn(
 
     ggml_sycl_fattn_alloc        K_f16(fbuf.K);
     ggml_sycl_fattn_alloc        V_f16(fbuf.V);
-    const ggml_sycl_fattn_extra  extra = ggml_sycl_fattn_get_extra(dst);
+    const ggml_sycl_fattn_extra  extra = ggml_sycl_fattn_get_extra(ctx.device, dst);
     ggml_sycl_pool_alloc<int>    KV_max(pool);
     ggml_sycl_pool_alloc<float>  dst_tmp(pool);
     ggml_sycl_pool_alloc<sycl::float2> dst_tmp_meta(pool);

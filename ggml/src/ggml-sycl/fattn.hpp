@@ -33,9 +33,9 @@ struct ggml_sycl_fattn_extra {
 // the reservation and hands out the pointers, so the two cannot disagree.
 // Each field is the address of one reserved block, or 0 if that block was not reserved,
 // in which case the caller allocates from the scratch pool instead.
-ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst);
+ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(int device, const ggml_tensor * dst);
 
-size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst);
+size_t ggml_sycl_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst);
 
 void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 

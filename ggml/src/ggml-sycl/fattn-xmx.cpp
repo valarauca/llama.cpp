@@ -885,18 +885,25 @@ static bool fattn_xmx_layout_ok(int device, dpct::queue_ptr stream) {
     return !host_bad;
 }
 
-// True when Q can be loaded as f32 straight from the tensor: head_dim 256 re-loads Q for every
-// tile, where converting it each time costs more than one separate f16 copy, and the 2D block
-// load needs a 64-byte aligned base and a 16-byte aligned pitch of at least 64 bytes. The MLA
-// kernel's rows are heads, so its pitch is the head stride and the query stride moves the base.
-static bool fattn_xmx_q_fused(const ggml_tensor * Q) {
-    if ((uintptr_t) Q->data % 64 != 0 || Q->nb[3] % 64 != 0) {
+// True when the strides of Q allow loading it as f32 straight from the tensor: head_dim 256
+// re-loads Q for every tile, where converting it each time costs more than one separate f16 copy,
+// and the 2D block load needs a 16-byte aligned pitch of at least 64 bytes. The MLA kernel's rows
+// are heads, so its pitch is the head stride and the query stride moves the base. Depends only on
+// the shape and strides, so scratch sizing gets the same answer at reserve and at execution.
+static bool fattn_xmx_q_fusable(const ggml_tensor * Q) {
+    if (Q->nb[3] % 64 != 0) {
         return false;
     }
     if (Q->ne[0] == XMX_MLA_DK) {
         return Q->nb[2] % 16 == 0 && Q->nb[2] >= 64 && Q->nb[1] % 64 == 0;
     }
     return Q->ne[0] != 256 && Q->nb[1] % 16 == 0 && Q->nb[1] >= 64 && Q->nb[2] % 64 == 0;
+}
+
+// The 2D block load also needs a 64-byte aligned base, which is only known at execution. A
+// fusable Q with a misaligned base is staged through the pool, since no scratch was reserved.
+static bool fattn_xmx_q_fused(const ggml_tensor * Q) {
+    return (uintptr_t) Q->data % 64 == 0 && fattn_xmx_q_fusable(Q);
 }
 
 static bool fattn_xmx_kv_type_ok(ggml_type type) {
@@ -947,8 +954,9 @@ static const sycl::half * fattn_xmx_stage(ggml_backend_sycl_context & ctx, ggml_
 
 #endif // GGML_SYCL_FA_XMX
 
-bool ggml_sycl_flash_attn_ext_xmx_supported(const ggml_tensor * dst) {
+bool ggml_sycl_flash_attn_ext_xmx_supported(int device, const ggml_tensor * dst) {
 #ifndef GGML_SYCL_FA_XMX
+    GGML_UNUSED(device);
     GGML_UNUSED(dst);
     return false;
 #else
@@ -958,7 +966,7 @@ bool ggml_sycl_flash_attn_ext_xmx_supported(const ggml_tensor * dst) {
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
-    const sycl_xe_family_caps & caps = get_xe_family_caps(ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.xe_family);
+    const sycl_xe_family_caps & caps = get_xe_family_caps(ggml_sycl_info().devices[device].hw_info.xe_family);
     if (caps.dpas_n != XMX_SG || !caps.block_2d_io) {
         return false;
     }
@@ -1001,12 +1009,13 @@ bool ggml_sycl_flash_attn_ext_xmx_supported(const ggml_tensor * dst) {
 #endif
 }
 
-bool ggml_sycl_flash_attn_ext_xmx_needs_q_f16(const ggml_tensor * dst) {
+bool ggml_sycl_flash_attn_ext_xmx_needs_q_f16(int device, const ggml_tensor * dst) {
 #ifndef GGML_SYCL_FA_XMX
+    GGML_UNUSED(device);
     GGML_UNUSED(dst);
     return false;
 #else
-    return ggml_sycl_flash_attn_ext_xmx_supported(dst) && !fattn_xmx_q_fused(dst->src[0]);
+    return ggml_sycl_flash_attn_ext_xmx_supported(device, dst) && !fattn_xmx_q_fusable(dst->src[0]);
 #endif
 }
 
@@ -1034,7 +1043,7 @@ void ggml_sycl_flash_attn_ext_xmx(ggml_backend_sycl_context & ctx, ggml_tensor *
     const bool    mla = D == XMX_MLA_DK;
     const int     TM  = mla ? 1 : D == 64 ? 16 : 8;
 
-    const ggml_sycl_fattn_extra                     extra  = ggml_sycl_fattn_get_extra(dst);
+    const ggml_sycl_fattn_extra                     extra  = ggml_sycl_fattn_get_extra(ctx.device, dst);
     const bool                                      v_on_k = K->type != GGML_TYPE_F16 && fattn_xmx_v_is_k_view(K, V);
     std::optional<ggml_sycl_pool_alloc<sycl::half>> K_pool;
     std::optional<ggml_sycl_pool_alloc<sycl::half>> V_pool;

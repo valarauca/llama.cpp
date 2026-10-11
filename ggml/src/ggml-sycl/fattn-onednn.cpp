@@ -25,8 +25,9 @@ bool ggml_sycl_fattn_onednn_binds_kv(const ggml_tensor * K, const ggml_tensor * 
     return bindable(K) && bindable(V);
 }
 
-bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use_shape_limit) {
+bool ggml_sycl_flash_attn_ext_onednn_supported(int device, const ggml_tensor * dst, bool use_shape_limit) {
 #if !GGML_SYCL_DNNL
+    GGML_UNUSED(device);
     GGML_UNUSED(dst);
     GGML_UNUSED(use_shape_limit);
     return false;
@@ -45,7 +46,7 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
     const ggml_tensor * sinks = dst->src[4];
 
     // F16 KV: native SDPA at any KV length.
-    // Non-F16: dequant to F16 then SDPA for prefill (Q >= 32), at any KV length. Only the
+    // Non-F16: dequant to F16 then SDPA at prefill lengths. Only the
     // standard quantized KV cache types (Q4_0-Q8_0) and F32 are accepted
     // because their to_fp16_sycl conversion is verified. BF16 and IQ*
     // are excluded: BF16 needs a strided conversion kernel that does not
@@ -72,7 +73,7 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
     // This is the improved SPDA gate. Rather than gating Alchemist GPUs from all SPDA features, we instead target only the failing shapes.
     // If the GPU being assessed isn't in the grouping below, it has full access to all SPDA shapes. Otherwise, if it's an Alchemist GPU, we block only the shapes with head sizes that fail.
     // It is much easier to compare the device to a small list of failing cases than to define all the passing ones.
-    const gpu_arch arch = ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.arch;
+    const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
     bool support_spda = !(arch == gpu_arch::intel_gpu_dg2_g10 ||
                          arch == gpu_arch::intel_gpu_dg2_g11 ||
                          arch == gpu_arch::intel_gpu_dg2_g12);
@@ -87,8 +88,8 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
         return false;
     }
     // gate for the following cases
-    // 1. a mask of a type other than f16 needs a different logical_tensor declaration
-    // 2. a mask must be shape [1, 1, q, seq]; without one the graph omits the Add node
+    // 1. types other than f16 need different logical_tensor declaration
+    // 2. the mask must be shape [1, 1, q, seq]
     // 3. sinks: excludes attention sink (Xiao et al., 2024) that can't be modeled by oneDNN graph
     if ((mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1)) || sinks) {
         return false;
@@ -260,7 +261,7 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     dnnl::engine    eng    = ctx.engine_dnnl(stream);
     dnnl::stream    strm   = ctx.stream_dnnl(stream);
 
-    const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
+    const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(ctx.device, dst);
 
     // Q: always f32 -- copy to dense f16.
     std::optional<ggml_sycl_pool_alloc<sycl::half>> Qf_pool;

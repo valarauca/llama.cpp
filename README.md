@@ -17,6 +17,28 @@
 
 </div>
 
+## About this fork
+
+This is a fork of llama.cpp centered on Intel GPU performance through the SYCL backend. The `feature/intel` branch is tuned and measured on an Intel Arc Pro B70 (Xe2 / Battlemage, 32 Xe cores). Work outside `ggml/src/ggml-sycl/` tracks upstream `master`, and the SYCL changes are mirrored in [valarauca/ggml](https://github.com/valarauca/ggml) `feature/intel`.
+
+### Changes on `feature/intel`
+
+- **Build**. `GGML_SYCL_XE_FAMILIES` (for example `xe2-hpg`) compiles ahead of time for named Xe families from a family table, which also picks the fp16 GEMM path per device.
+- **Flash attention**. A joint_matrix (XMX / DPAS) kernel is the default for prefill at head dim 64, 128 and 256 and for MLA (576 / 512), with f16, q8_0 and q4_0 K/V. At head dim 256 one work-group fills an Xe core with four heads of one KV head, a last partial wave runs as a split-KV launch, and blocks inside the all-zero mask prefix skip the mask. Unmasked attention and short quantized KV go through oneDNN SDPA. `GGML_SYCL_FA_XMX=0` turns the XMX kernel off and `GGML_SYCL_FA_KERNEL=tile|onednn|xmx` forces one.
+- **MoE**. Small-batch expert routing on the device, grouped XMX prefill for Q4_0, IQ4_XS, Q8_0, the K-quants, IQ3_S and IQ4_NL, and an optional expert cache in pinned host memory with per-layer GPU slots (`-ot "...exps=SYCL0_MOE"`, `GGML_SYCL_MOE_CACHE_SLOTS`).
+- **Quantized matmul**. Reorder layouts for the IQ types, oneDNN weight-decompression prefill for Q4_0, Q8_0, the K-quants and the IQ types, faster MMVQ (weights shared across columns, IQ4 codebook in registers), fused gate / up / GLU decode, and the quantized activation reused across sibling mat-muls.
+- **Fusions and graphs**. rope + view + set_rows (including mrope and imrope), fused GDN gate projections, and SYCL graphs replayed instead of re-recorded.
+- **Correctness**. Zero-point corrections in Q4_1 / Q5_0 / Q5_1 MMVQ matched to the CPU, f32 sigmoid for half and bf16, the q2_0 quantizer, IM2COL index range, non-contiguous CONV_2D and ROLL, and padded KV views in the MKL and oneDNN flash-attention paths.
+- **Tools**. `test-fattn-ab` compares the SYCL flash-attention kernels with the CPU result (`--gpu-only` for profiling, `--kernel` to pick kernels).
+
+Prefill on the B70 with default settings (`llama-bench -fa 1`, t/s, `feature/intel` 0cd1f282a and 9cfeb3e2f):
+
+| model | pp512 | pp512 @ d4096 | pp512 @ d32768 | pp512 @ d65536 |
+|---|---:|---:|---:|---:|
+| Qwen3-VL-8B F16 | 5761 | | | |
+| Qwen3.8-27B Q4_0 | 1391 | 1333 | 968 | 737 |
+| Qwen3-Coder-30B-A3B Q4_0 | 3137 | 2793 | | 610 |
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:

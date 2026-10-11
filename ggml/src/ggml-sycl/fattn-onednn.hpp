@@ -5,7 +5,7 @@
 
 // Static-only check: fused-XMX oneDNN Graph SDPA path==flash-attn op
 // (f16 KV, no softcap/ALiBi, single stream, tuned head_dim, prefill-sized q.)
-bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use_shape_limit = true);
+bool ggml_sycl_flash_attn_ext_onednn_supported(int device, const ggml_tensor * dst, bool use_shape_limit = true);
 
 // True when the oneDNN path binds an F16 KV cache in place instead of staging a dense copy of
 // it. Depends only on the types and strides of K and V, so the answer holds for every call.

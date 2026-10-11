@@ -137,6 +137,24 @@ static void k_get_rows_float(
     dst_row[i00] = src0_row[i00];
 }
 
+// Same-type row gather in 16-byte chunks, for rows whose size and strides are multiples of 16 bytes.
+static void k_get_rows_vec16(const char * src0, const int32_t * src1, char * dst, int64_t n16, int64_t ne12,
+                             size_t nb1, size_t nb2, size_t nb3, size_t nb01, size_t nb02, size_t nb03, size_t s10,
+                             size_t s11, size_t s12, const sycl::nd_item<3> & item_ct1) {
+    const int64_t i00 = (int64_t) item_ct1.get_group(2) * item_ct1.get_local_range(2) + item_ct1.get_local_id(2);
+    if (i00 >= n16) {
+        return;
+    }
+    const int i10 = item_ct1.get_group(1);
+    const int i11 = item_ct1.get_group(0) / ne12;
+    const int i12 = item_ct1.get_group(0) % ne12;
+    const int i01 = src1[i10 * s10 + i11 * s11 + i12 * s12];
+
+    const sycl::uint4 * src_row = (const sycl::uint4 *) (src0 + i01 * nb01 + i11 * nb02 + i12 * nb03);
+    sycl::uint4 *       dst_row = (sycl::uint4 *) (dst + i10 * nb1 + i11 * nb2 + i12 * nb3);
+    dst_row[i00]                = src_row[i00];
+}
+
 template <int qk, int qr, dequantize_kernel_t dq>
 static void get_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor *src0, const ggml_tensor *src1,
                           ggml_tensor *dst, const void *src0_dd,
@@ -228,6 +246,21 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
     const size_t s11 = nb11 / ggml_element_size(src1);
     const size_t s12 = nb12 / ggml_element_size(src1);
     //const size_t s13 = nb13 / ggml_element_size(src1);
+
+    const size_t row_bytes = ne00 * sizeof(src0_t);
+    if (std::is_same_v<src0_t, dst_t> && row_bytes % 16 == 0 && nb01 % 16 == 0 && nb02 % 16 == 0 &&
+        nb03 % 16 == 0 && nb1 % 16 == 0 && nb2 % 16 == 0 && nb3 % 16 == 0 && (uintptr_t) src0_dd % 16 == 0 &&
+        (uintptr_t) dst_dd % 16 == 0) {
+        const int64_t        n16 = row_bytes / 16;
+        const sycl::range<3> vec_nums(ne11 * ne12, ne10, (n16 + SYCL_GET_ROWS_BLOCK_SIZE - 1) / SYCL_GET_ROWS_BLOCK_SIZE);
+        const char *         src0_c = (const char *) src0_dd;
+        char *               dst_c  = (char *) dst_dd;
+        stream->parallel_for(sycl::nd_range<3>(vec_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
+            k_get_rows_vec16(src0_c, src1_dd, dst_c, n16, ne12, nb1, nb2, nb3, nb01, nb02, nb03, s10, s11, s12,
+                             item_ct1);
+        });
+        return;
+    }
 
     {
         dpct::has_capability_or_fail(stream->get_device(),
